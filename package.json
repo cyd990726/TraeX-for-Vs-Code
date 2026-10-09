@@ -1,0 +1,132 @@
+{
+  "name": "traecli-sidebar",
+  "displayName": "TRAE CLI Sidebar",
+  "description": "Use TRAE CLI through a theme-aware chat in the VS Code secondary sidebar.",
+  "version": "0.14.2",
+  "publisher": "local-traecli",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.104.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:traecli.chat"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "tsc --noEmit",
+    "vscode:prepublish": "npm run check && npm run build",
+    "package": "vsce package --allow-missing-repository",
+    "test": "node --test tests/agent.test.mjs tests/review.test.mjs tests/sidebar.test.mjs tests/usage.test.mjs",
+    "test:host": "npm run build && node tests/run-host.mjs",
+    "test:ui": "npm run build && node tests/chat.test.mjs"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "traecli-chat",
+          "title": "TRAE CLI",
+          "icon": "media/trae.svg"
+        }
+      ]
+    },
+    "views": {
+      "traecli-chat": [
+        {
+          "type": "webview",
+          "id": "traecli.chat",
+          "name": "TRAE CLI"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "traecli.restart",
+        "title": "TRAE CLI: New Session",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "traecli.sendSelection",
+        "title": "TRAE CLI: Send Selection"
+      },
+      {
+        "command": "traecli.open",
+        "title": "TRAE CLI: Open Chat",
+        "icon": {
+          "light": "media/trae-light.svg",
+          "dark": "media/trae-dark.svg"
+        }
+      },
+      {
+        "command": "traecli.reviewChanges",
+        "title": "TRAE CLI: Review Changes"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "traecli.sendSelection",
+          "when": "editorHasSelection",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "traecli.open",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "TRAE CLI",
+      "properties": {
+        "traecli.executable": {
+          "type": "string",
+          "default": "traecli",
+          "scope": "machine",
+          "description": "CLI executable name or absolute path. Restart the session after changing."
+        },
+        "traecli.arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "machine",
+          "description": "Global CLI arguments passed before acp serve (for example -c key=value)."
+        },
+        "traecli.maxContextCharacters": {
+          "type": "number",
+          "default": 200000,
+          "minimum": 1000,
+          "maximum": 1000000,
+          "description": "Maximum combined message and attachment characters per turn."
+        }
+      }
+    }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "TRAE CLI can execute commands and edit workspace files."
+    }
+  },
+  "dependencies": {
+    "diff": "^9.0.0",
+    "dompurify": "^3.4.16",
+    "marked": "^18.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.25.0",
+    "playwright": "^1.64.0",
+    "typescript": "^5.9.0"
+  }
+}

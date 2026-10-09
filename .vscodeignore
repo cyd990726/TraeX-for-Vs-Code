@@ -1,0 +1,14 @@
+src/**
+.vscode/**
+.gitignore
+build.mjs
+tsconfig.json
+node_modules/**
+media/chat.css
+*.vsix
+tests/**
+docs/**
+
+.vscode-test/**
+
+scripts/**

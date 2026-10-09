@@ -1,0 +1,32 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {build} from 'esbuild';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+const directory=await mkdtemp(join(tmpdir(),'trae-usage-'));
+await build({entryPoints:['src/usage.ts'],outfile:join(directory,'usage.cjs'),bundle:true,platform:'node'});
+const {UsageStore}=await import(join(directory,'usage.cjs'));
+const day=86400000, now=40*day;
+await test('cumulative updates, duplicates, resumed history and persistence do not double count',()=>{
+ const store=new UsageStore(undefined,now);
+ store.update('new',100,false,now); store.update('new',100,false,now);store.update('new',160,false,now);
+ store.baseline('old',1000);store.update('old',1050,true,now);
+ assert.deepEqual(store.summary('old',now),{session:1050,day:210,week:210,month:210,since:now});
+ const restored=new UsageStore(JSON.parse(JSON.stringify(store.data)),now);
+ restored.update('new',160,true,now);restored.update('new',180,true,now);
+ assert.equal(restored.summary('new',now).day,230);
+ restored.update('unknown',5000,true,now);assert.equal(restored.summary('unknown',now).day,230);
+ restored.update('unknown',5010,true,now);assert.equal(restored.summary('unknown',now).day,240);
+});
+await test('rolling windows expire independently and retain session totals',()=>{
+ const store=new UsageStore(undefined,0);
+ store.update('t',10,false,now-31*day);store.update('t',30,false,now-8*day);
+ store.update('t',60,false,now-2*day);store.update('t',100,false,now);
+ assert.deepEqual(store.summary('t',now),{session:100,day:40,week:70,month:90,since:0});
+ assert.equal(store.data.records.length,3);
+ store.update('t',90,false,now);store.update('t',NaN,false,now);
+ assert.equal(store.summary('t',now).session,100);
+ assert.equal(store.summary('t',now+day+1).day,0);
+});
+await rm(directory,{recursive:true,force:true});
