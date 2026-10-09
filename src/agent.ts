@@ -80,7 +80,7 @@ export class Agent {
       }
     });
     await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-    await this.rpc('initialize', { clientInfo: { name: 'traecli-vscode', title: 'TRAE CLI Sidebar', version: '0.14.8' }, capabilities: { experimentalApi: false } });
+    await this.rpc('initialize', { clientInfo: { name: 'traecli-vscode', title: 'TRAE CLI Sidebar', version: '0.14.9' }, capabilities: { experimentalApi: false } });
     this.write({ method: 'initialized', params: {} });
     this.options.status?.('已连接');
   }

@@ -22,9 +22,11 @@ import type { McpServerElicitationRequestParams } from './protocol/v2/McpServerE
 import type { McpElicitationSchema } from './protocol/v2/McpElicitationSchema';
 import type { McpElicitationPrimitiveSchema } from './protocol/v2/McpElicitationPrimitiveSchema';
 import type { ModelFallbackEvent } from './protocol/v2/ModelFallbackEvent';
+import type { RequestPermissionProfile } from './protocol/v2/RequestPermissionProfile';
 
 type Message = { role: 'user' | 'assistant' | 'tool' | 'error'; text: string; id: string; turnId?: string; detail?: string; status?: string; process?: boolean; reasoningHasSummary?: boolean; processKind?: string; toolName?: string; paths?: string[]; changes?: { path: string; diff: string; currentPath?: string }[] };
-type Approval = { id: string; title: string; detail: string; accept: unknown; decline: unknown; resolve: (response: unknown) => void };
+type ApprovalChoice = { id: string; label: string; description?: string; kind?: 'secondary' | 'danger'; response: unknown };
+type Approval = { id: string; title: string; detail: string; choices: ApprovalChoice[]; decline: unknown; resolve: (response: unknown) => void };
 type ModelLoad = { percent: number; queueSize?: number };
 type QueueStatus = { turnId: string; state: string; position: number | null; message: string | null; operation: string | null };
 type SessionSummary = { id: string; name?: string | null; preview?: string; updatedAt: number; cwd: string; model?: string | null };
@@ -147,10 +149,7 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
       if (message.type === 'attach') void target.attachFile();
       if (message.type === 'removeAttachment') { target.attachments = target.attachments.filter(item => item.id !== message.id); this.sync(); }
       if (message.type === 'openFile' && typeof message.path === 'string') void target.openFile(message.path);
-      if (message.type === 'permission' && typeof message.id === 'string') {
-        const pending = target.approvals.get(message.id); if (!pending) return;
-        pending.resolve(message.decision === 'accept' ? pending.accept : pending.decline); target.phase = '处理中'; target.approvals.delete(message.id); this.sync();
-      }
+      if (message.type === 'permission' && typeof message.id === 'string' && typeof message.choice === 'string') target.resolveApproval(message.id, message.choice);
     });
     view.onDidDispose(() => { listener.dispose(); if (this.view === view) this.view = undefined; });
   }
@@ -174,7 +173,7 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
       this.fingerprints.set(message.id, signature); return reset || previous !== signature;
     });
     this.fullSync = false;
-    void this.view.webview.postMessage({ type: 'state', viewKey: target.runtimeId, authRequired: this.authRequired || target.authRequired, loginPending: this.loginPending, loginError: this.loginError, page: this.page, project: vscode.workspace.workspaceFolders?.[0]?.name ?? '未打开项目', sessions: sessionRows, conversationTitle: sessionRows.find(session => session.id === (target.threadId ?? target.runtimeId))?.title ?? '新会话', historyLoading: this.historyLoading, historyError: this.historyError, hasMoreSessions: !!this.historyCursor, currentSession: target.threadId, activeTurnId: target.activeTurnId, reset, messages: changed, removed, busy: target.busy, transition: target.transition, connection: target.connection, reconnectNeeded: target.reconnectNeeded, phase: target.phase, startedAt: target.turnStartedAt, draftRevision: target.draftRevision, draft: target.draft, model: target.selectedModel?.displayName ?? '默认模型', tokenUsage: { session: this.usage.summary(target.threadId).session }, permissionMode: target.permissionMode, modelMode: target.selectedMode, modeLabel: target.modeOptions?.find(option => option.id === target.selectedMode)?.name, modeSupported: target.modeOptions ? target.modeOptions.length > 0 : undefined, reasoning: target.selectedReasoning, reasoningSupported: target.reasoningOptions ? target.reasoningOptions.length > 0 : undefined, attachments: target.attachments.map(({ id, label, text }) => ({ id, label, size: text.length })), approvals: [...target.approvals.values()].map(({ id, title, detail }) => ({ id, title, detail })) });
+    void this.view.webview.postMessage({ type: 'state', viewKey: target.runtimeId, authRequired: this.authRequired || target.authRequired, loginPending: this.loginPending, loginError: this.loginError, page: this.page, project: vscode.workspace.workspaceFolders?.[0]?.name ?? '未打开项目', sessions: sessionRows, conversationTitle: sessionRows.find(session => session.id === (target.threadId ?? target.runtimeId))?.title ?? '新会话', historyLoading: this.historyLoading, historyError: this.historyError, hasMoreSessions: !!this.historyCursor, currentSession: target.threadId, activeTurnId: target.activeTurnId, reset, messages: changed, removed, busy: target.busy, transition: target.transition, connection: target.connection, reconnectNeeded: target.reconnectNeeded, phase: target.phase, startedAt: target.turnStartedAt, draftRevision: target.draftRevision, draft: target.draft, model: target.selectedModel?.displayName ?? '默认模型', tokenUsage: { session: this.usage.summary(target.threadId).session }, permissionMode: target.permissionMode, modelMode: target.selectedMode, modeLabel: target.modeOptions?.find(option => option.id === target.selectedMode)?.name, modeSupported: target.modeOptions ? target.modeOptions.length > 0 : undefined, reasoning: target.selectedReasoning, reasoningSupported: target.reasoningOptions ? target.reasoningOptions.length > 0 : undefined, attachments: target.attachments.map(({ id, label, text }) => ({ id, label, size: text.length })), approvals: [...target.approvals.values()].map(({ id, title, detail, choices }) => ({ id, title, detail, choices: choices.map(({id,label,description,kind}) => ({id,label,description,kind})) })) });
   }
   private cliOptions() {
     const folder = vscode.workspace.workspaceFolders?.[0];
@@ -440,22 +439,38 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     this.normalizeMessage(message);
   }
   private async request(request: ServerRequest): Promise<unknown> {
-    if (request.method === 'item/commandExecution/requestApproval' || request.method === 'item/fileChange/requestApproval') {
-      const detail = request.method === 'item/commandExecution/requestApproval' ? `${request.params.command ?? ''}\n${request.params.cwd ?? ''}\n${request.params.reason ?? ''}` : request.params.reason ?? '允许修改文件？';
-      return this.waitForApproval(request.id, request.method === 'item/fileChange/requestApproval' ? '文件修改需要授权' : '命令执行需要授权', detail, {decision:'accept'}, {decision:'decline'});
+    if (request.method === 'item/commandExecution/requestApproval') {
+      const params = request.params;
+      const detail = [params.command, params.cwd ? `工作目录：${params.cwd}` : '', params.reason ? `原因：${params.reason}` : '', params.networkApprovalContext ? `网络目标：${params.networkApprovalContext.protocol}://${params.networkApprovalContext.host}` : ''].filter(Boolean).join('\n');
+      const extras: ApprovalChoice[] = [];
+      if (params.proposedExecpolicyAmendment?.length) extras.push({id:'remember-command',label:'允许并记住此类命令',description:'保存 CLI 提议的命令规则，当前会话后续匹配操作不再询问。',kind:'secondary',response:{decision:{acceptWithExecpolicyAmendment:{execpolicy_amendment:params.proposedExecpolicyAmendment}}}});
+      for (const [index, amendment] of (params.proposedNetworkPolicyAmendments ?? []).entries()) {
+        const allow = amendment.action === 'allow';
+        extras.push({id:`network-policy-${index}`,label:`${allow ? '允许' : '拒绝'}并记住 ${amendment.host}`,description:`保存网络规则：${amendment.action} ${amendment.host}`,kind:allow?'secondary':'danger',response:{decision:{applyNetworkPolicyAmendment:{network_policy_amendment:amendment}}}});
+      }
+      const decline = {decision:'decline'};
+      return this.waitForApproval(request.id, '命令执行需要授权', detail || '允许执行该命令？', this.modernApprovalChoices(extras), decline);
+    }
+    if (request.method === 'item/fileChange/requestApproval') {
+      const detail = [request.params.reason, request.params.grantRoot ? `请求写入目录：${request.params.grantRoot}` : ''].filter(Boolean).join('\n') || '允许修改文件？';
+      const decline = {decision:'decline'};
+      return this.waitForApproval(request.id, '文件修改需要授权', detail, this.modernApprovalChoices(), decline);
     }
     if (request.method === 'item/permissions/requestApproval') {
       const detail = [request.params.reason, `工作目录：${request.params.cwd}`, JSON.stringify(request.params.permissions, null, 2)].filter(Boolean).join('\n\n');
-      return this.waitForApproval(request.id, '需要额外的文件或网络权限', detail, {decision:'accept'}, {decision:'decline'});
+      const choices = this.permissionApprovalChoices(request.params.permissions);
+      return this.waitForApproval(request.id, '需要额外的文件或网络权限', detail, choices, choices.at(-1)!.response);
     }
     if (request.method === 'applyPatchApproval') {
       const files = Object.keys(request.params.fileChanges).join('\n') || '未提供文件列表';
       const detail = [request.params.reason, request.params.grantRoot ? `授权目录：${request.params.grantRoot}` : '', files].filter(Boolean).join('\n\n');
-      return this.waitForApproval(request.id, '文件修改需要授权', detail, {decision:'approved'}, {decision:'denied'});
+      const decline = {decision:{denied:{rejection:'用户拒绝了文件修改'}}};
+      return this.waitForApproval(request.id, '文件修改需要授权', detail, this.legacyApprovalChoices(), decline);
     }
     if (request.method === 'execCommandApproval') {
       const detail = [`${request.params.command.join(' ')}`, request.params.cwd, request.params.reason ?? ''].filter(Boolean).join('\n');
-      return this.waitForApproval(request.id, '命令执行需要授权', detail, {decision:'approved'}, {decision:'denied'});
+      const decline = {decision:{denied:{rejection:'用户拒绝了命令执行'}}};
+      return this.waitForApproval(request.id, '命令执行需要授权', detail, this.legacyApprovalChoices(), decline);
     }
     if (request.method === 'item/tool/requestUserInput') {
       const epoch = this.epoch;
@@ -478,9 +493,39 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     if (request.method === 'attestation/generate') throw this.serverRequestError('当前 VS Code 扩展不提供设备证明能力。', -32601);
     throw this.serverRequestError(`尚不支持服务端请求：${(request as ServerRequest).method}`, -32601);
   }
-  private waitForApproval(idValue: string | number, title: string, detail: string, accept: unknown, decline: unknown) {
+  private modernApprovalChoices(extras: ApprovalChoice[] = []): ApprovalChoice[] {
+    return [
+      {id:'accept',label:'允许一次',description:'只允许当前这次操作。',response:{decision:'accept'}},
+      {id:'accept-session',label:'本会话允许',description:'当前 CLI 会话内后续同类请求不再询问。',kind:'secondary',response:{decision:'acceptForSession'}},
+      ...extras,
+      {id:'decline',label:'拒绝并继续',description:'拒绝这次操作，让模型尝试其他办法。',kind:'secondary',response:{decision:'decline'}},
+      {id:'cancel',label:'拒绝并停止',description:'拒绝这次操作并立即停止当前任务。',kind:'danger',response:{decision:'cancel'}},
+    ];
+  }
+  private legacyApprovalChoices(): ApprovalChoice[] {
+    return [
+      {id:'accept',label:'允许一次',description:'只允许当前这次操作。',response:{decision:'approved'}},
+      {id:'accept-session',label:'本会话允许',description:'当前 CLI 会话内后续同类请求不再询问。',kind:'secondary',response:{decision:'approved_for_session'}},
+      {id:'decline',label:'拒绝并继续',description:'拒绝这次操作，让模型尝试其他办法。',kind:'secondary',response:{decision:{denied:{rejection:'用户拒绝了此操作'}}}},
+      {id:'cancel',label:'拒绝并停止',description:'拒绝这次操作并立即停止当前任务。',kind:'danger',response:{decision:'abort'}},
+    ];
+  }
+  private permissionApprovalChoices(requested: RequestPermissionProfile): ApprovalChoice[] {
+    const permissions = {...(requested.network ? {network:requested.network} : {}),...(requested.fileSystem ? {fileSystem:requested.fileSystem} : {})};
+    return [
+      {id:'grant-turn',label:'允许本任务',description:'只在当前任务内授予列出的额外权限。',response:{permissions,scope:'turn'}},
+      {id:'grant-session',label:'本会话允许',description:'在当前 CLI 会话内持续授予列出的额外权限。',kind:'secondary',response:{permissions,scope:'session'}},
+      {id:'decline',label:'拒绝',description:'不授予任何额外权限，让模型尝试其他办法。',kind:'danger',response:{permissions:{},scope:'turn'}},
+    ];
+  }
+  private resolveApproval(id: string, choiceId: string) {
+    const pending = this.approvals.get(id); if (!pending) return false;
+    const choice = pending.choices.find(option => option.id === choiceId); if (!choice) return false;
+    pending.resolve(choice.response); this.approvals.delete(id); this.phase = this.approvals.size ? '等待授权' : '处理中'; this.sync(); return true;
+  }
+  private waitForApproval(idValue: string | number, title: string, detail: string, choices: ApprovalChoice[], decline: unknown) {
     return new Promise(resolve => {
-      const id = String(idValue); this.phase = '等待授权'; this.approvals.set(id, { id, title, detail, accept, decline, resolve }); this.sync();
+      const id = String(idValue); this.phase = '等待授权'; this.approvals.set(id, { id, title, detail, choices, decline, resolve }); this.sync();
     });
   }
   private serverRequestError(message: string, code: number) {

@@ -67,7 +67,7 @@ try {
  assert.equal(await page.locator('.process-label').textContent(),'正在启动');assert.equal(await page.locator('.process-group[data-status=inProgress]').count(),1);assert.equal(await page.locator('.process-items').isVisible(),false);
  await update({reset:true,busy:false,transition:false,phase:'发送失败',messages:[{id:'pending-user',role:'user',text:'解释项目',status:'failed'}]});
  assert.equal(await page.locator('article.user.failed').count(),1);assert.equal(await page.locator('.message-status').textContent(),'发送失败 · 内容已恢复到输入框');
- await update({busy:true,transition:false,phase:'执行命令',startedAt:Date.now()-45000,messages:[{id:'u1',role:'user',text:'检查构建错误'},{id:'t1',role:'tool',text:'npm run build',status:'inProgress',detail:'Building…'},{id:'a1',role:'assistant',text:'正在检查构建配置。\n\n```ts\nconst root = workspace;\n```'}],attachments:[{id:'c1',label:'src/index.ts:12'}],approvals:[{id:'p1',title:'命令执行需要授权',detail:'npm run build'}]});
+ await update({busy:true,transition:false,phase:'执行命令',startedAt:Date.now()-45000,messages:[{id:'u1',role:'user',text:'检查构建错误'},{id:'t1',role:'tool',text:'npm run build',status:'inProgress',detail:'Building…'},{id:'a1',role:'assistant',text:'正在检查构建配置。\n\n```ts\nconst root = workspace;\n```'}],attachments:[{id:'c1',label:'src/index.ts:12'}],approvals:[{id:'p1',title:'命令执行需要授权',detail:'npm run build',choices:[{id:'accept',label:'允许一次',description:'只允许这次操作'},{id:'accept-session',label:'本会话允许',description:'本会话不再询问',kind:'secondary'},{id:'decline',label:'拒绝并继续',kind:'secondary'},{id:'cancel',label:'拒绝并停止',kind:'danger'}]}]});
 	 const userBox=await page.locator('article.user').boundingBox();const messagesBox=await page.locator('#messages').boundingBox();
 	 assert.ok(userBox.width<messagesBox.width*.9);assert.ok(Math.abs(userBox.x+userBox.width-(messagesBox.x+messagesBox.width-6))<2);
  const statusBox=await page.locator('#status').boundingBox();
@@ -114,8 +114,11 @@ try {
  await update({busy:false});assert.equal(await page.locator('.process-group[data-status=inProgress]').count(),0);
  await update({reset:true,busy:true,activeTurnId:'new-turn',phase:'模型处理中',messages:[{id:'old-user',role:'user',text:'旧任务'},{id:'old-tool',turnId:'old-turn',role:'tool',text:'旧工具',status:'inProgress'},{id:'old-reply',role:'assistant',text:'旧任务仍有迟到状态'},{id:'new-user',role:'user',text:'新任务'},{id:'new-tool',turnId:'new-turn',role:'tool',text:'新任务步骤',status:'completed'}]});
  assert.equal(await page.locator('.process-group').count(),2);assert.equal(await page.locator('.process-group').first().locator('.process-indicator').isVisible(),false);assert.equal(await page.locator('.process-group').last().locator('.process-indicator').isVisible(),true);
- await page.getByRole('button',{name:'允许一次'}).click();
- assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='permission'&&message.decision==='accept')));
+ assert.deepEqual(await page.locator('.approval-actions button').allTextContents(),['允许一次','本会话允许','拒绝并继续','拒绝并停止']);
+ assert.equal(await page.getByRole('button',{name:'拒绝并停止'}).getAttribute('class'),'approval-danger');
+ await page.getByRole('button',{name:'本会话允许'}).click();
+ assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='permission'&&message.choice==='accept-session')));
+ assert.equal(await page.locator('.approval-actions button:disabled').count(),4);
  await update({busy:true,phase:'模型处理中'});
  await page.locator('#send').click();assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='stop')));
  await update({busy:false,approvals:[]});

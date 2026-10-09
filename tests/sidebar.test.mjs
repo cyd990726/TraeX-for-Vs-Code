@@ -286,13 +286,26 @@ await test('raw reasoning events create a live process without exposing hidden r
   sidebar.update({method:'item/completed',params:{threadId:'t',item:{id:'r',type:'reasoning',summary:[]}}});assert.equal(sidebar.messages[0].status,'completed');assert.equal(sidebar.messages[0].detail,'summary continues');
  }finally{sidebar.dispose();}
 });
-await test('permission, legacy approval and MCP form requests return safe protocol responses',async()=>{
+await test('approval requests expose protocol-specific choices and return valid responses',async()=>{
  const sidebar=controller();
  try {
-  const permission=sidebar.request({id:'permissions',method:'item/permissions/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'item',environmentId:null,startedAtMs:Date.now(),cwd:'/tmp',reason:'需要联网',permissions:{network:{enabled:true},fileSystem:null}}});
-  const pending=sidebar.approvals.get('permissions');assert.match(pending.detail,/需要联网/);pending.resolve(pending.accept);sidebar.approvals.delete('permissions');assert.deepEqual(await permission,{decision:'accept'});
+  const command=sidebar.request({id:'command',method:'item/commandExecution/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'item',startedAtMs:Date.now(),command:'curl https://example.com',cwd:'/tmp',reason:'需要联网',networkApprovalContext:{host:'example.com',protocol:'https'},proposedExecpolicyAmendment:['curl','*'],proposedNetworkPolicyAmendments:[{host:'example.com',action:'allow'}]}});
+  let pending=sidebar.approvals.get('command');
+  assert.deepEqual(pending.choices.map(choice=>choice.id),['accept','accept-session','remember-command','network-policy-0','decline','cancel']);assert.match(pending.detail,/https:\/\/example.com/);
+  assert.deepEqual(pending.choices.find(choice=>choice.id==='remember-command').response,{decision:{acceptWithExecpolicyAmendment:{execpolicy_amendment:['curl','*']}}});
+  assert.equal(sidebar.resolveApproval('command','invented'),false);assert.equal(sidebar.approvals.has('command'),true);
+  assert.equal(sidebar.resolveApproval('command','accept-session'),true);assert.deepEqual(await command,{decision:'acceptForSession'});
+  const file=sidebar.request({id:'file',method:'item/fileChange/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'file-item',startedAtMs:Date.now(),reason:'写入配置',grantRoot:'/tmp/project'}});
+  assert.deepEqual(sidebar.approvals.get('file').choices.map(choice=>choice.label),['允许一次','本会话允许','拒绝并继续','拒绝并停止']);sidebar.resolveApproval('file','cancel');assert.deepEqual(await file,{decision:'cancel'});
+  const permission=sidebar.request({id:'permissions',method:'item/permissions/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'permission-item',environmentId:null,startedAtMs:Date.now(),cwd:'/tmp',reason:'需要联网',permissions:{network:{enabled:true},fileSystem:null}}});
+  pending=sidebar.approvals.get('permissions');assert.match(pending.detail,/需要联网/);assert.deepEqual(pending.choices.map(choice=>choice.label),['允许本任务','本会话允许','拒绝']);sidebar.resolveApproval('permissions','grant-session');
+  assert.deepEqual(await permission,{permissions:{network:{enabled:true}},scope:'session'});
+  const deniedPermission=sidebar.request({id:'permissions-denied',method:'item/permissions/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'permission-item-2',environmentId:null,startedAtMs:Date.now(),cwd:'/tmp',reason:null,permissions:{network:null,fileSystem:{read:['/outside'],write:null}}}});
+  sidebar.resolveApproval('permissions-denied','decline');assert.deepEqual(await deniedPermission,{permissions:{},scope:'turn'});
   const legacy=sidebar.request({id:'legacy',method:'execCommandApproval',params:{conversationId:'t',callId:'call',approvalId:null,command:['npm','test'],cwd:'/tmp',reason:null,parsedCmd:[]}});
-  sidebar.clearApprovals();assert.deepEqual(await legacy,{decision:'denied'});
+  sidebar.resolveApproval('legacy','accept-session');assert.deepEqual(await legacy,{decision:'approved_for_session'});
+  const legacyDenied=sidebar.request({id:'legacy-denied',method:'execCommandApproval',params:{conversationId:'t',callId:'call-2',approvalId:null,command:['npm','publish'],cwd:'/tmp',reason:null,parsedCmd:[]}});
+  sidebar.clearApprovals();assert.deepEqual(await legacyDenied,{decision:{denied:{rejection:'用户拒绝了命令执行'}}});
   const form=await sidebar.request({id:'mcp',method:'mcpServer/elicitation/request',params:{threadId:'t',turnId:'turn',serverName:'demo',mode:'form',_meta:null,message:'配置',requestedSchema:{type:'object',required:['enabled'],properties:{enabled:{type:'boolean',title:'启用'},name:{type:'string',title:'名称',default:'demo'}}}}});
   assert.deepEqual(form,{action:'accept',content:{enabled:true,name:'demo'}});
   await assert.rejects(sidebar.request({id:'tool',method:'item/tool/call',params:{threadId:'t',turnId:'turn',callId:'call',namespace:null,tool:'missing',arguments:{}}}),error=>error.code===-32601&&/未注册动态工具/.test(error.message));

@@ -600,7 +600,13 @@ window.addEventListener('message', ({ data }) => {
     approvals.replaceChildren(); approvals.dataset.signature = approvalSignature;
     for (const approval of data.approvals) {
       const card = element('div', 'approval'); card.append(element('strong', '', approval.title), element('pre', '', approval.detail));
-      for (const [decision, label] of [['accept', '允许一次'], ['decline', '拒绝']]) { const button = element('button', '', label); button.onclick = () => { for (const button of card.querySelectorAll('button')) button.disabled = true; post({ type: 'permission', id: approval.id, decision }); }; card.append(button); }
+      const actions = element('div', 'approval-actions');
+      for (const choice of approval.choices ?? []) {
+        const button = element('button', choice.kind ? `approval-${choice.kind}` : '', choice.label); button.type = 'button'; button.title = choice.description ?? '';
+        button.onclick = () => { for (const button of card.querySelectorAll('button')) button.disabled = true; post({ type: 'permission', id: approval.id, choice: choice.id }); };
+        actions.append(button);
+      }
+      card.append(actions);
       approvals.append(card);
     }
   }
