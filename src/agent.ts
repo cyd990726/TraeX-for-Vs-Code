@@ -52,16 +52,25 @@ export class Agent {
       if (message.method) {
         if (message.id !== undefined) {
           const id = message.id;
-          void this.options.request(message as ServerRequest).then(result => { if (transport === this.transport) this.write({ id, result }); }, error => { if (transport === this.transport) this.write({ id, error: { code: -32603, message: String(error) } }); });
+          void this.options.request(message as ServerRequest).then(result => { if (transport === this.transport) this.write({ id, result }); }, error => {
+            if (transport !== this.transport) return;
+            const code = typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'number' ? error.code : -32603;
+            this.write({ id, error: { code, message: error instanceof Error ? error.message : String(error) } });
+          });
         } else {
           const event = message as ServerNotification;
           if (event.method === 'queue/status' && event.params.threadId === this.threadId) {
-            if (['queued', 'waiting', 'ready'].includes(event.params.state)) this.turnId = event.params.turnId;
-            const timeout = ['queued', 'waiting'].includes(event.params.state) ? this.options.queuedTurnTimeoutMs ?? 10 * 60 * 1000 : this.options.rpcTimeoutMs ?? 30000;
-            for (const [id, pending] of this.pending) if (pending.method === 'turn/start') this.armTimeout(id, timeout);
+            if (event.params.operation !== 'contextCompaction' && ['queued', 'waiting', 'ready'].includes(event.params.state)) this.turnId = event.params.turnId;
+            const timeout = event.params.operation === 'contextCompaction' || ['queued', 'waiting'].includes(event.params.state) ? this.options.queuedTurnTimeoutMs ?? 10 * 60 * 1000 : this.options.rpcTimeoutMs ?? 30000;
+            const queuedMethod = event.params.operation === 'contextCompaction' ? 'thread/compact/start' : 'turn/start';
+            for (const [id, pending] of this.pending) if (pending.method === queuedMethod) this.armTimeout(id, timeout);
           }
           if (event.method === 'turn/started' && event.params.threadId === this.threadId) this.turnId = event.params.turn.id;
-          if (event.method === 'turn/completed') { this.completedTurns.add(event.params.turn.id); if (event.params.threadId === this.threadId) this.turnId = undefined; }
+          if (event.method === 'turn/completed') {
+            this.completedTurns.add(event.params.turn.id);
+            while (this.completedTurns.size > 1000) this.completedTurns.delete(this.completedTurns.values().next().value!);
+            if (event.params.threadId === this.threadId && (!this.turnId || event.params.turn.id === this.turnId)) this.turnId = undefined;
+          }
           this.options.update(event);
         }
       } else if (typeof message.id === 'number') {
@@ -71,7 +80,7 @@ export class Agent {
       }
     });
     await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-    await this.rpc('initialize', { clientInfo: { name: 'traecli-vscode', title: 'TRAE CLI Sidebar', version: '0.14.6' }, capabilities: { experimentalApi: false } });
+    await this.rpc('initialize', { clientInfo: { name: 'traecli-vscode', title: 'TRAE CLI Sidebar', version: '0.14.8' }, capabilities: { experimentalApi: false } });
     this.write({ method: 'initialized', params: {} });
     this.options.status?.('已连接');
   }
@@ -87,20 +96,20 @@ export class Agent {
       pending.reject(error);
     }, delay);
   }
-  private rpc<T>(method: string, params: unknown): Promise<T> {
+  private rpc<T>(method: string, params: unknown, timeout = this.options.rpcTimeoutMs ?? 30000): Promise<T> {
     return new Promise((resolve, reject) => {
       const id = ++this.nextId;
       this.pending.set(id, { resolve: value => resolve(value as T), reject, method });
-      this.armTimeout(id, this.options.rpcTimeoutMs ?? 30000); this.write({ id, method, params });
+      this.armTimeout(id, timeout); this.write({ id, method, params });
     });
   }
   private fail(error: Error) { for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); } this.pending.clear(); }
   async history(cursor?: string) { await this.initialize(); return this.rpc<ThreadListResponse>('thread/list', { cwd: this.options.cwd, limit: 50, sortKey: 'updated_at', cursor: cursor ?? null }); }
   async skills() { await this.initialize(); return this.rpc<{data:{cwd:string;skills:{name:string;description:string;path:string;enabled:boolean}[]}[]}>('skills/list', {cwds:[this.options.cwd],forceReload:true}); }
-  async compact(guidance?: string) { await this.initialize(); if (!this.threadId) throw new Error('请先开始一个会话'); return this.rpc('thread/compact/start', {threadId:this.threadId,...(guidance ? {userGuidance:guidance} : {})}); }
+  async compact(guidance?: string) { await this.initialize(); if (!this.threadId) throw new Error('请先开始一个会话'); return this.rpc('thread/compact/start', {threadId:this.threadId,...(guidance ? {userGuidance:guidance} : {})}, this.options.queuedTurnTimeoutMs ?? 10 * 60 * 1000); }
   async models() { await this.initialize(); return this.rpc<ModelListResponse>('model/list', {}); }
-  async resume(threadId: string) { await this.initialize(); const result = await this.rpc<ThreadResumeResponse>('thread/resume', { threadId, cwd: this.options.cwd }); this.defaultPermissions = result.approvalPolicy && result.sandbox ? {approvalPolicy:result.approvalPolicy,sandboxPolicy:result.sandbox} : undefined; this.threadId = result.thread.id; this.turnId = result.thread.turns.find(turn => turn.status === 'inProgress')?.id; return result; }
-  newThread() { this.threadId = undefined; this.turnId = undefined; }
+  async resume(threadId: string) { await this.initialize(); const result = await this.rpc<ThreadResumeResponse>('thread/resume', { threadId, cwd: this.options.cwd }); this.defaultPermissions = result.approvalPolicy && result.sandbox ? {approvalPolicy:result.approvalPolicy,sandboxPolicy:result.sandbox} : undefined; this.threadId = result.thread.id; this.turnId = result.thread.turns.find(turn => turn.status === 'inProgress')?.id; this.completedTurns.clear(); return result; }
+  newThread() { this.threadId = undefined; this.turnId = undefined; this.completedTurns.clear(); }
   async prompt(text: string, model?: string, modelProvider?: string, effort?: ReasoningEffort, modelBackendVariant?: string, permissions?: Permissions, skills?: {name:string;path:string}[]) {
     this.cancelled = false;
     await this.initialize();

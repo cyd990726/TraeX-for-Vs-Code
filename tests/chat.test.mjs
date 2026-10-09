@@ -65,6 +65,8 @@ try {
  assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='send'&&message.text==='解释项目')));
  await update({transition:true,phase:'准备请求',startedAt:Date.now(),messages:[{id:'pending-user',role:'user',text:'解释项目'}]});
  assert.equal(await page.locator('.process-label').textContent(),'正在启动');assert.equal(await page.locator('.process-group[data-status=inProgress]').count(),1);assert.equal(await page.locator('.process-items').isVisible(),false);
+ await update({reset:true,busy:false,transition:false,phase:'发送失败',messages:[{id:'pending-user',role:'user',text:'解释项目',status:'failed'}]});
+ assert.equal(await page.locator('article.user.failed').count(),1);assert.equal(await page.locator('.message-status').textContent(),'发送失败 · 内容已恢复到输入框');
  await update({busy:true,transition:false,phase:'执行命令',startedAt:Date.now()-45000,messages:[{id:'u1',role:'user',text:'检查构建错误'},{id:'t1',role:'tool',text:'npm run build',status:'inProgress',detail:'Building…'},{id:'a1',role:'assistant',text:'正在检查构建配置。\n\n```ts\nconst root = workspace;\n```'}],attachments:[{id:'c1',label:'src/index.ts:12'}],approvals:[{id:'p1',title:'命令执行需要授权',detail:'npm run build'}]});
 	 const userBox=await page.locator('article.user').boundingBox();const messagesBox=await page.locator('#messages').boundingBox();
 	 assert.ok(userBox.width<messagesBox.width*.9);assert.ok(Math.abs(userBox.x+userBox.width-(messagesBox.x+messagesBox.width-6))<2);
@@ -110,6 +112,8 @@ try {
  assert.equal(await page.locator('.process-group').first().locator('.process-indicator').isVisible(),false);assert.equal(await page.locator('.process-group').last().locator('.process-indicator').isVisible(),true);assert.equal(await page.locator('.process-group').last().locator('.process-label').textContent(),'思考中');
  await update({messages:state.messages.map(message=>message.id==='latest-thought'?{...message,status:'completed'}:message)});assert.equal(await page.locator('.process-group[data-status=inProgress]').count(),1);assert.equal(await page.locator('.process-group').first().locator('.process-indicator').isVisible(),false);assert.equal(await page.locator('.process-group').last().locator('.process-label').textContent(),'模型处理中');
  await update({busy:false});assert.equal(await page.locator('.process-group[data-status=inProgress]').count(),0);
+ await update({reset:true,busy:true,activeTurnId:'new-turn',phase:'模型处理中',messages:[{id:'old-user',role:'user',text:'旧任务'},{id:'old-tool',turnId:'old-turn',role:'tool',text:'旧工具',status:'inProgress'},{id:'old-reply',role:'assistant',text:'旧任务仍有迟到状态'},{id:'new-user',role:'user',text:'新任务'},{id:'new-tool',turnId:'new-turn',role:'tool',text:'新任务步骤',status:'completed'}]});
+ assert.equal(await page.locator('.process-group').count(),2);assert.equal(await page.locator('.process-group').first().locator('.process-indicator').isVisible(),false);assert.equal(await page.locator('.process-group').last().locator('.process-indicator').isVisible(),true);
  await page.getByRole('button',{name:'允许一次'}).click();
  assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='permission'&&message.decision==='accept')));
  await update({busy:true,phase:'模型处理中'});
@@ -240,6 +244,13 @@ try {
  }
  await page.locator('#permissions').click();await page.getByRole('menuitemradio',{name:'只读',exact:false}).click();assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='selectPermissions'&&message.mode==='read-only')));
  await update({permissionMode:'read-only'});assert.equal(await page.locator('#permissions').textContent(),'只读⌄');
+ await page.locator('#permissions').click();assert.equal(await page.locator('.permissions-menu').isVisible(),true);
+ await update({busy:true,transition:false});
+ assert.equal(await page.locator('#permissions').isDisabled(),true);assert.equal(await page.locator('.permissions-menu').isVisible(),false);
+ assert.equal(await page.locator('.permissions-anchor').getAttribute('title'),'当前任务已按启动时权限运行，任务结束后可修改。');
+ await page.locator('#prompt').fill('/permissions');assert.equal(await page.locator('.slash-option').isDisabled(),true);
+ await page.locator('#prompt').fill('');await update({busy:false});
+ assert.equal(await page.locator('#permissions').isEnabled(),true);assert.match(await page.locator('#permissions').getAttribute('title'),/下一个任务生效/);
  await page.setViewportSize({width:380,height:800});await page.locator('#permissions').click();await page.screenshot({path:'docs/permissions-preview.png'});await page.locator('#permissions').press('Escape');
  await update({tokenUsage:{session:12345}});
  assert.equal(await page.locator('.usage-range').count(),0);

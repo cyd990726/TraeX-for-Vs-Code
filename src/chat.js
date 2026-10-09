@@ -280,6 +280,9 @@ function activeSlash(index) {
   const node=slashMenu.querySelectorAll('[role=option]')[index];
   if(node) {prompt.setAttribute('aria-activedescendant',node.id);const top=node.offsetTop,bottom=top+node.offsetHeight;if(top<slashMenu.scrollTop)slashMenu.scrollTop=top;else if(bottom>slashMenu.scrollTop+slashMenu.clientHeight)slashMenu.scrollTop=bottom-slashMenu.clientHeight;}else prompt.removeAttribute('aria-activedescendant');
 }
+function slashOptionDisabled(option) {
+  return !!stateSnapshot?.transition || (running && (slashStage === 'permissions' || (!slashStage && ['compact','init','permissions'].includes(option.id))));
+}
 function renderSlash(query='') {
   const renderKey=JSON.stringify([slashStage,query,slashOptions,slashLoading,slashError,running,!!stateSnapshot?.transition]);
   if(!slashMenu.hidden && slashRenderKey===renderKey)return;
@@ -291,7 +294,7 @@ function renderSlash(query='') {
   slashRows.forEach((option,index)=>{
     const button=element('button','slash-option');button.type='button';button.id='slash-option-'+index;button.setAttribute('role','option');
     button.append(element('span','slash-name',option.label+(option.selected?' ✓':'')),element('span','slash-description',option.description??''));
-    button.disabled=!!stateSnapshot?.transition || (!slashStage && running && ['compact','init'].includes(option.id));
+    button.disabled=slashOptionDisabled(option);
     button.onpointermove=()=>activeSlash(index);button.onclick=()=>chooseSlash(index);slashMenu.append(button);
   });
   if(!slashRows.length)slashMenu.append(element('div','slash-empty',slashLoading?'正在加载…':slashError || (slashStage ? '没有匹配的可选项' : '没有匹配的命令')));
@@ -311,7 +314,7 @@ function refreshSlash() {
 }
 function commitSlashDraft() {lastDraft=prompt.value;post({type:'draft',text:prompt.value,revision:++revision});resizePrompt();}
 function chooseSlash(index) {
-  const option=slashRows[index];if(!option || stateSnapshot?.transition || (!slashStage && running && ['compact','init'].includes(option.id)))return;
+  const option=slashRows[index];if(!option || slashOptionDisabled(option))return;
   if(!slashStage && option.picker) {prompt.value='/'+option.id+' ';commitSlashDraft();slashDismissed=undefined;refreshSlash();prompt.focus();return;}
   const command=slashStage || option.id;const selected=slashStage ? option.id : undefined;
   prompt.value='';commitSlashDraft();closeSlash();slashStage='';post({type:'slashExecute',command,option:selected});prompt.focus();
@@ -440,7 +443,7 @@ window.addEventListener('message', ({ data }) => {
   const taskInProgress = !!data.busy || !!data.transition;
   const hasCurrentProcess = visible.slice(latestUserIndex + 1).some(message => message.role === 'tool' && message.process !== false);
   if (taskInProgress && end === all.length && latestUserIndex >= 0 && !hasCurrentProcess) {
-    visible.splice(latestUserIndex + 1, 0, { id: `activity-${data.viewKey ?? 'chat'}`, role: 'tool', text: '任务状态', status: 'inProgress', processKind: 'activity' });
+    visible.splice(latestUserIndex + 1, 0, { id: `activity-${data.viewKey ?? 'chat'}`, turnId:data.activeTurnId, role: 'tool', text: '任务状态', status: 'inProgress', processKind: 'activity' });
   }
   latestUserIndex = visible.findLastIndex(message => message.role === 'user');
   let pager = messages.querySelector('.pager');
@@ -470,8 +473,13 @@ window.addEventListener('message', ({ data }) => {
   modelButton.title = '模型：' + data.model;
   permissionMode = permissionChoices.some(option=>option.id===data.permissionMode) ? data.permissionMode : 'default';
   permissionsButton.textContent = permissionChoices.find(option=>option.id===permissionMode).name + '⌄';
-  permissionsButton.title = permissionChoices.find(option=>option.id===permissionMode).description + ' 下一次请求生效。';
-  permissionsButton.disabled = !!data.transition;
+  const permissionsLocked = !!data.busy || !!data.transition;
+  const permissionsTitle = permissionsLocked ? '当前任务已按启动时权限运行，任务结束后可修改。' : permissionChoices.find(option=>option.id===permissionMode).description + ' 下一个任务生效。';
+  if (permissionsLocked) { permissionsMenu.hidden = true; permissionsButton.setAttribute('aria-expanded','false'); }
+  permissionsAnchor.title = permissionsTitle;
+  permissionsButton.title = permissionsTitle;
+  permissionsButton.setAttribute('aria-label', permissionsLocked ? permissionsTitle : '选择权限。' + permissionsTitle);
+  permissionsButton.disabled = permissionsLocked;
   modeAnchor.hidden = data.modeSupported === false;
   actions.dataset.mode = String(!modeAnchor.hidden);
   if (modeAnchor.hidden) {
@@ -531,7 +539,7 @@ window.addEventListener('message', ({ data }) => {
     let node = nodes.get(message.id);
     if (!node) {
       node = element('article', message.role);
-      if (message.role !== 'tool') { node.append(element('div', 'content')); if (message.role === 'assistant') { const copy = element('button', 'copy', '复制'); copy.onclick = () => post({ type: 'copy', text: store.get(message.id)?.text ?? '' }); node.append(copy); } }
+      if (message.role !== 'tool') { node.append(element('div', 'content')); if (message.role === 'user') node.append(element('span','message-status')); if (message.role === 'assistant') { const copy = element('button', 'copy', '复制'); copy.onclick = () => post({ type: 'copy', text: store.get(message.id)?.text ?? '' }); node.append(copy); } }
       nodes.set(message.id, node);
     }
     if (isProcess) {
@@ -543,6 +551,7 @@ window.addEventListener('message', ({ data }) => {
       previous=node;
     }
     node.classList.toggle('streaming', message.role === 'assistant' && message.status === 'streaming');
+    node.classList.toggle('failed', message.status === 'failed');
     const signature = JSON.stringify(message);
     if (node.dataset.signature !== signature) {
       if (message.role === 'tool') {
@@ -559,12 +568,12 @@ window.addEventListener('message', ({ data }) => {
           const files = details.querySelector('.files'); files.replaceChildren();
           for (const path of message.paths ?? []) { const button = element('button', '', path.split(/[\\/]/).pop()); button.title = path; button.onclick = () => post({ type: 'reviewFile', id: message.id, path }); files.append(button); }
         }
-      } else { const body = node.querySelector('.content'); if (message.role === 'assistant') { if (message.status === 'streaming' || streams.has(message.id)) queueStream(node, message); else finishMarkdown(body, message.text); } else body.textContent = message.text; }
+      } else { const body = node.querySelector('.content'); if (message.role === 'assistant') { if (message.status === 'streaming' || streams.has(message.id)) queueStream(node, message); else finishMarkdown(body, message.text); } else { body.textContent = message.text; const delivery=node.querySelector('.message-status'); if(delivery){delivery.textContent=message.status==='failed'?'发送失败 · 内容已恢复到输入框':'';delivery.hidden=message.status!=='failed';} } }
       node.dataset.signature = signature;
     }
   }
   const processEntries=[...usedProcesses.values()];
-  const currentProcessEntries=processEntries.filter(entry=>latestUserIndex<0||entry.startIndex>latestUserIndex);
+  const currentProcessEntries=data.activeTurnId ? processEntries.filter(entry=>entry.steps.some(step=>step.turnId===data.activeTurnId)) : processEntries.filter(entry=>latestUserIndex<0||entry.startIndex>latestUserIndex);
   const waitingForApproval=/等待授权/.test(phase);
   const foregroundProcess=waitingForApproval ? undefined : currentProcessEntries.findLast(entry=>entry.steps.some(step=>step.status==='inProgress'&&!['plan','activity'].includes(step.processKind)));
   const fallbackProcess=taskInProgress ? currentProcessEntries.at(-1) : undefined;
@@ -585,7 +594,7 @@ window.addEventListener('message', ({ data }) => {
     group.querySelector('.process-items').hidden=!realSteps.length;
     group.dataset.status=active?'inProgress':fallbackActive&&waitingForApproval?'waiting':backgroundActive?'background':failed?'failed':'completed';
   }
-  for(const [key,group] of processGroups) if(!usedProcesses.has(key)) {group.remove();processGroups.delete(key);}
+  for(const [key,group] of processGroups) if(!usedProcesses.has(key)) {group.remove();processGroups.delete(key);processOpen.delete(key);}
   const approvalSignature = JSON.stringify(data.approvals);
   if (approvals.dataset.signature !== approvalSignature) {
     approvals.replaceChildren(); approvals.dataset.signature = approvalSignature;

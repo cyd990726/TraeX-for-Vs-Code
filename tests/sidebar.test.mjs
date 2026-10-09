@@ -12,7 +12,7 @@ await test('send failure preserves submitted draft, newer typing and attachments
  const sidebar=controller();
  sidebar.attachments=[{id:'attachment',label:'test.ts',text:'context'}];
  sidebar.agent={prompt:async()=>{sidebar.draft='new typing';throw new Error('offline');},dispose(){}};
- try{await sidebar.send('original');assert.equal(sidebar.draft,'original\n\nnew typing');assert.equal(sidebar.attachments[0].id,'attachment');assert.equal(sidebar.busy,false);}finally{sidebar.dispose();}
+ try{await sidebar.send('original');assert.equal(sidebar.draft,'original\n\nnew typing');assert.equal(sidebar.attachments[0].id,'attachment');assert.equal(sidebar.busy,false);assert.equal(sidebar.messages.find(message=>message.role==='user').status,'failed');}finally{sidebar.dispose();}
 });
 await test('send snapshots draft and attachments before asynchronous preflight',async()=>{
  const sidebar=controller();let releaseAuth;let submitted;
@@ -247,6 +247,9 @@ await test('slash option lists use model catalog and permissions; skills become 
   await sidebar.loadSlashOptions('permissions',3);assert.equal(responses.at(-1).options.length,4);
   await sidebar.executeSlash('permissions','read-only');assert.equal(sidebar.permissionMode,'read-only');
   await sidebar.executeSlash('permissions','invalid');assert.equal(sidebar.permissionMode,'read-only');
+  sidebar.busy=true;await sidebar.executeSlash('permissions','full');assert.equal(sidebar.permissionMode,'read-only');
+  sidebar.busy=false;sidebar.transition=true;await sidebar.executeSlash('permissions','full');assert.equal(sidebar.permissionMode,'read-only');sidebar.transition=false;
+  await sidebar.executeSlash('permissions','full');assert.equal(sidebar.permissionMode,'full');
   await sidebar.loadSlashOptions('skills',4);assert.equal(responses.at(-1).options.length,1);
   await sidebar.executeSlash('skills','/tmp/off.md');assert.equal(sidebar.attachments.length,0);
   await sidebar.executeSlash('skills','/tmp/skill.md');assert.deepEqual(sidebar.attachments[0].skill,{name:'demo',path:'/tmp/skill.md'});
@@ -282,4 +285,60 @@ await test('raw reasoning events create a live process without exposing hidden r
   delta('item/reasoning/summaryTextDelta',' continues');assert.equal(sidebar.messages[0].detail,'summary continues');
   sidebar.update({method:'item/completed',params:{threadId:'t',item:{id:'r',type:'reasoning',summary:[]}}});assert.equal(sidebar.messages[0].status,'completed');assert.equal(sidebar.messages[0].detail,'summary continues');
  }finally{sidebar.dispose();}
+});
+await test('permission, legacy approval and MCP form requests return safe protocol responses',async()=>{
+ const sidebar=controller();
+ try {
+  const permission=sidebar.request({id:'permissions',method:'item/permissions/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'item',environmentId:null,startedAtMs:Date.now(),cwd:'/tmp',reason:'需要联网',permissions:{network:{enabled:true},fileSystem:null}}});
+  const pending=sidebar.approvals.get('permissions');assert.match(pending.detail,/需要联网/);pending.resolve(pending.accept);sidebar.approvals.delete('permissions');assert.deepEqual(await permission,{decision:'accept'});
+  const legacy=sidebar.request({id:'legacy',method:'execCommandApproval',params:{conversationId:'t',callId:'call',approvalId:null,command:['npm','test'],cwd:'/tmp',reason:null,parsedCmd:[]}});
+  sidebar.clearApprovals();assert.deepEqual(await legacy,{decision:'denied'});
+  const form=await sidebar.request({id:'mcp',method:'mcpServer/elicitation/request',params:{threadId:'t',turnId:'turn',serverName:'demo',mode:'form',_meta:null,message:'配置',requestedSchema:{type:'object',required:['enabled'],properties:{enabled:{type:'boolean',title:'启用'},name:{type:'string',title:'名称',default:'demo'}}}}});
+  assert.deepEqual(form,{action:'accept',content:{enabled:true,name:'demo'}});
+  await assert.rejects(sidebar.request({id:'tool',method:'item/tool/call',params:{threadId:'t',turnId:'turn',callId:'call',namespace:null,tool:'missing',arguments:{}}}),error=>error.code===-32601&&/未注册动态工具/.test(error.message));
+ } finally {sidebar.dispose();}
+});
+await test('context compaction queue state does not lock the ordinary turn lifecycle',()=>{
+ const sidebar=controller();sidebar.threadId='t';
+ try {
+  sidebar.update({method:'queue/status',params:{threadId:'t',turnId:'compact-turn',state:'waiting',operation:'contextCompaction',position:2,message:null}});
+  assert.equal(sidebar.busy,false);assert.equal(sidebar.transition,true);assert.equal(sidebar.compacting,true);assert.match(sidebar.phase,/上下文压缩排队中/);
+  sidebar.update({method:'thread/compacted',params:{threadId:'t',turnId:'compact-turn'}});
+  assert.equal(sidebar.transition,false);assert.equal(sidebar.compacting,false);assert.equal(sidebar.phase,'就绪');assert.equal(sidebar.messages.at(-1).text,'上下文已压缩');
+ } finally {sidebar.dispose();}
+});
+await test('turn completion only finishes process state owned by that turn',()=>{
+ const sidebar=controller();sidebar.threadId='t';sidebar.busy=true;sidebar.activeTurnId='new-turn';sidebar.messages=[{id:'old',turnId:'old-turn',role:'tool',text:'旧任务',status:'inProgress'},{id:'new',turnId:'new-turn',role:'tool',text:'新任务',status:'inProgress'}];
+ try {
+  sidebar.update({method:'turn/completed',params:{threadId:'t',turn:{id:'old-turn',status:'completed',error:null}}});
+  assert.equal(sidebar.busy,true);assert.equal(sidebar.messages[0].status,'completed');assert.equal(sidebar.messages[1].status,'inProgress');
+  sidebar.phase='模型处理中';sidebar.update({method:'item/reasoning/textDelta',params:{threadId:'t',turnId:'old-turn',itemId:'late-old-reasoning',delta:'hidden'}});
+  assert.equal(sidebar.phase,'模型处理中');assert.equal(sidebar.messages.at(-1).status,'completed');
+  sidebar.update({method:'turn/completed',params:{threadId:'t',turn:{id:'new-turn',status:'completed',error:null}}});
+  assert.equal(sidebar.busy,false);assert.equal(sidebar.activeTurnId,undefined);assert.equal(sidebar.messages[1].status,'completed');
+ } finally {sidebar.dispose();}
+});
+await test('model fallback is visible and records the committed effective model',()=>{
+ const sidebar=controller();sidebar.threadId='t';sidebar.activeTurnId='turn';sidebar.busy=true;
+ const from={ordinal:null,provider:'p',model:'primary',modelBackendVariant:null};const target={ordinal:1,provider:'p',model:'backup',modelBackendVariant:'max'};
+ try {
+  sidebar.update({method:'model/fallback',params:{threadId:'t',turnId:'turn',event:{type:'attemptStarted',ordinal:1,from,to:target,trigger:'modelCapacity'}}});
+  let message=sidebar.messages.at(-1);assert.equal(message.process,false);assert.equal(message.status,'inProgress');assert.match(message.text,/backup/);
+  sidebar.update({method:'model/fallback',params:{threadId:'t',turnId:'turn',event:{type:'committed',ordinal:1,configuredPrimary:from,target,trigger:'modelCapacity',attemptCount:1,settings:{}}}});
+  message=sidebar.messages.at(-1);assert.equal(message.status,'completed');assert.match(message.text,/backup/);assert.match(message.detail,/共尝试 1 次/);
+ } finally {sidebar.dispose();}
+});
+await test('message, virtual document and idle live-session caches are bounded',async()=>{
+ const sidebar=controller();let rootDisposed=0;sidebar.threadId='root-thread';sidebar.lastActivityAt=-1;sidebar.agent={dispose:()=>rootDisposed++};
+ try {
+  for(let index=0;index<520;index++) sidebar.pushMessage({id:'message-'+index,role:'assistant',text:'message'});
+  assert.equal(sidebar.messages.length,500);assert.equal(sidebar.messages[0].id,'message-20');
+  sidebar.messages=[{id:'command',turnId:'turn',role:'tool',text:'build',status:'inProgress',processKind:'commandExecution',detail:''}];
+  sidebar.update({method:'item/commandExecution/outputDelta',params:{threadId:'root-thread',turnId:'turn',itemId:'command',delta:'x'.repeat(210000)}});
+  assert.ok(sidebar.messages[0].detail.length<=200000);assert.match(sidebar.messages[0].detail,/已省略较早内容/);
+  for(let index=0;index<45;index++) sidebar.virtualUri(`doc-${index}.txt`,'content');
+  assert.equal(sidebar.virtualDocuments.size,40);
+  for(let index=0;index<6;index++) await sidebar.restart();
+  assert.equal(sidebar.liveSessions.size,6);assert.equal(rootDisposed,1);assert.ok(sidebar.sessions.some(session=>session.id==='root-thread'));
+ } finally {sidebar.dispose();}
 });

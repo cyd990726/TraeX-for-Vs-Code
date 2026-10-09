@@ -6,7 +6,10 @@ rl.on('line',line=>{
  if (message.method==='initialize') send(process.env.TRAE_TEST_FAIL_INIT==='1'?{id:message.id,error:{message:'test initialization failure'}}:{id:message.id,result:{}});
  if (message.method==='thread/list') send({id:message.id,result:{data:[],nextCursor:null}});
  if (message.method==='skills/list') send({id:message.id,result:{data:[{cwd:message.params.cwds[0],skills:[{name:'demo',path:'/tmp/demo/SKILL.md',description:'Demo skill',enabled:true}]}]}});
- if (message.method==='thread/compact/start') send({id:message.id,result:{threadId:message.params.threadId,userGuidance:message.params.userGuidance}});
+ if (message.method==='thread/compact/start') {
+  const complete=()=>send({id:message.id,result:{threadId:message.params.threadId,userGuidance:message.params.userGuidance}});
+  if(process.env.TRAE_TEST_COMPACT_QUEUE==='1'){send({method:'queue/status',params:{threadId:message.params.threadId,turnId:'compact-turn',state:'waiting',operation:'contextCompaction',position:2,message:null}});setTimeout(complete,60);}else complete();
+ }
  if (message.method==='model/list') send({id:message.id,result:{data:[{model:'test-model'}]}});
  if (message.method==='thread/start') {send({method:'thread/started',params:{thread:{id:threadId},approvalPolicy:'untrusted',sandbox:{type:'readOnly',networkAccess:false}}});send({id:message.id,result:{thread:{id:threadId},approvalPolicy:'untrusted',sandbox:{type:'readOnly',networkAccess:false}}});}
  if (message.method==='thread/resume') send({id:message.id,result:{thread:{id:message.params.threadId,turns:[]}}});

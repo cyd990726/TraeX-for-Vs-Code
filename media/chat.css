@@ -172,3 +172,5 @@ textarea { resize: none; line-height: 1.5; min-height: calc(3em + 15px); padding
 @media(prefers-reduced-motion:reduce) {.process-group[data-status=inProgress]>.process-summary .process-indicator,.process-group[data-status=inProgress]>.process-summary .process-label {animation:none;}}
 
 article.user {width:fit-content;max-width:min(100%,calc(100vw * 2 / 3));min-width:3.5em;margin-left:auto;}
+article.user.failed {border-color:color-mix(in srgb,var(--vscode-errorForeground) 55%,transparent);}
+.message-status {display:block;margin-top:6px;font-size:10px;color:var(--vscode-errorForeground);text-align:right;}

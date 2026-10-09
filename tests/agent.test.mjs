@@ -47,6 +47,15 @@ await test('queue status extends the turn start timeout',async()=>{
  const agent=new Agent({executable:process.execPath,args:[resolve('tests/mock-server.cjs')],cwd:process.cwd(),env:{...process.env,TRAE_TEST_QUEUE:'1'},queuedTurnTimeoutMs:150,update:event=>events.push(event),request:async()=>({decision:'decline'}),log:()=>{},exited:()=>{}});
  try{await agent.models();agent.options.rpcTimeoutMs=20;assert.equal(await agent.prompt('queued'),'thread-test');assert.ok(events.some(event=>event.method==='queue/status'&&event.params.position===3));}finally{agent.dispose();}
 });
+await test('context compaction uses the long queue timeout without becoming an interruptible turn',async()=>{
+ const events=[];
+ const agent=new Agent({executable:process.execPath,args:[resolve('tests/mock-server.cjs')],cwd:process.cwd(),env:{...process.env,TRAE_TEST_COMPACT_QUEUE:'1'},queuedTurnTimeoutMs:150,update:event=>events.push(event),request:async()=>({decision:'decline'}),log:()=>{},exited:()=>{}});
+ try{
+  await agent.resume('saved-thread');agent.options.rpcTimeoutMs=20;
+  assert.deepEqual(await agent.compact('keep decisions'),{threadId:'saved-thread',userGuidance:'keep decisions'});
+  assert.equal(agent.turnId,undefined);assert.ok(events.some(event=>event.method==='queue/status'&&event.params.operation==='contextCompaction'));
+ }finally{agent.dispose();}
+});
 await test('permission overrides reach the CLI and default restores the original policy',async()=>{
  const events=[];
  const agent=new Agent({executable:process.execPath,args:[resolve('tests/mock-server.cjs')],cwd:process.cwd(),env:{...process.env,TRAE_TEST_PERMISSIONS:'1'},update:event=>events.push(event),request:async()=>({decision:'decline'}),log:()=>{},exited:()=>{}});
