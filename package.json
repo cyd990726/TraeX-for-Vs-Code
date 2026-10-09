@@ -2,7 +2,7 @@
   "name": "traecli-sidebar",
   "displayName": "TRAE CLI Sidebar",
   "description": "Use TRAE CLI through a theme-aware chat in the VS Code secondary sidebar.",
-  "version": "0.14.2",
+  "version": "0.14.6",
   "publisher": "local-traecli",
   "license": "MIT",
   "engines": {

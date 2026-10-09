@@ -22,6 +22,8 @@ import type { Model } from './protocol/v2/Model';
 
 type Message = { role: 'user' | 'assistant' | 'tool' | 'error'; text: string; id: string; detail?: string; status?: string; process?: boolean; reasoningHasSummary?: boolean; processKind?: string; toolName?: string; paths?: string[]; changes?: { path: string; diff: string; currentPath?: string }[] };
 type Approval = { id: string; title: string; detail: string; resolve: (response: unknown) => void };
+type ModelLoad = { percent: number; queueSize?: number };
+type QueueStatus = { turnId: string; state: string; position: number | null; message: string | null; operation: string | null };
 export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
   // Each live conversation owns an independent CLI process and task state.
   private readonly runtimeId = 'local-' + randomBytes(8).toString('hex');
@@ -51,6 +53,9 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
   private historyRequest = 0;
   private sessionDrafts = new Map<string, { text: string; attachments: Attachment[] }>();
   private selectedModel?: Pick<Model, 'model' | 'displayName' | 'modelProviderId'>;
+  private modelLoad?: ModelLoad;
+  private queueStatus?: QueueStatus;
+  private queueLoadTurnId?: string;
   private selectedReasoning?: ReasoningEffort;
   private reasoningOptions?: ReasoningEffortOption[];
   private permissionMode: PermissionMode = 'default';
@@ -265,14 +270,20 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     }
     if (event.method === 'turn/started') {
       const now = Date.now();
-      this.busy = true; this.turnStartedAt ??= now; this.lastActivityAt = now;
+      this.busy = true; this.turnStartedAt ??= now; this.lastActivityAt = now; this.queueStatus = undefined; this.queueLoadTurnId = undefined; this.phase = '模型处理中';
+    }
+    if (event.method === 'queue/status') {
+      this.busy = true; this.turnStartedAt ??= Date.now(); this.lastActivityAt = Date.now();
+      const queue = this.queueStatus = { turnId: event.params.turnId, state: event.params.state, position: event.params.position, message: event.params.message, operation: event.params.operation };
+      this.phase = this.queuePhase(queue.state, queue.position, queue.message, queue.operation);
+      if (!queue.operation && this.queueLoadTurnId !== queue.turnId) { this.queueLoadTurnId = queue.turnId; void this.refreshModelLoad(queue.turnId); }
     }
     if (event.method === 'turn/plan/updated') {
       const id = 'plan-' + event.params.turnId;
       const text = event.params.plan.map(step => `${step.status === 'completed' ? '✓' : '○'} ${step.step}`).join('\n');
       const existing = this.messages.find(item => item.id === id);
       const status=event.params.plan.every(step=>step.status==='completed')?'completed':'inProgress';
-      if (existing) {existing.detail = text;existing.status=status;} else this.messages.push({ id, role: 'tool', text: '执行计划', detail: text, status });
+      if (existing) {existing.detail = text;existing.status=status;existing.processKind='plan';existing.toolName='计划';} else this.messages.push({ id, role: 'tool', text: '执行计划', detail: text, status, processKind:'plan', toolName:'计划' });
     }
     if (event.method === 'item/agentMessage/delta') {
       const existing = this.messages.find(item => item.id === event.params.itemId);
@@ -304,7 +315,7 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
       if (existing) existing.detail = ((existing.detail ?? '') + event.params.delta).slice(-200000);
     }
     if (event.method === 'turn/completed') {
-      this.busy = false; this.phase = '就绪'; this.turnStartedAt = undefined; this.clearApprovals();
+      this.busy = false; this.phase = '就绪'; this.turnStartedAt = undefined; this.queueStatus = undefined; this.queueLoadTurnId = undefined; this.clearApprovals();
       for(const message of this.messages)if(message.role==='tool' && message.status==='inProgress')message.status=event.params.turn.status==='completed'?'completed':'interrupted';
       for (const message of this.messages) if (message.status === 'streaming') message.status = 'completed';
       if (event.params.turn.error) this.error(event.params.turn.error.message);
@@ -352,21 +363,25 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     this.inFlight = { text, attachments: submittedAttachments, messageId: 'pending-' + randomBytes(8).toString('hex') };
     this.draft = ''; this.attachments = []; this.stashDraft();
     void this.context.workspaceState.update('draft', '');
+    const startedAt = Date.now();
+    this.turnStartedAt = startedAt; this.lastActivityAt = startedAt; this.phase = '准备请求';
+    this.messages.push({ role: 'user', text: input, id: this.inFlight.messageId });
     this.transition = true; this.sync();
     try {
       if (!await this.ensureAuthenticated() || epoch !== this.epoch) { this.restoreInFlight(); return; }
-      if ((this.selectedReasoning && !this.reasoningOptions) || (this.selectedMode && !this.modeOptions)) {
+      const needsCatalog = (this.selectedReasoning && !this.reasoningOptions) || (this.selectedMode && !this.modeOptions);
+      if (needsCatalog) {
         const models = (await this.getAgent().models()).data;
-        const model = models.find(model => model.model === this.selectedModel?.model && model.modelProviderId === this.selectedModel?.modelProviderId);
-        if (model) this.applyModeCatalog(model); else { this.selectedMode = undefined; this.modeOptions = []; this.selectedReasoning = undefined; this.reasoningOptions = []; }
+        const model = this.selectedModel ? models.find(model => model.model === this.selectedModel?.model && model.modelProviderId === this.selectedModel?.modelProviderId) : models.find(model => model.isDefault);
+        if (model) this.applyModeCatalog(model);
+        else { this.selectedMode = undefined; this.modeOptions = []; this.selectedReasoning = undefined; this.reasoningOptions = []; }
       }
       if (epoch !== this.epoch) { this.restoreInFlight(); return; }
     }
     catch (error) { this.restoreInFlight(); this.error(String(error)); return; }
     finally { this.transition = false; this.sync(); }
-    const startedAt = Date.now();
     this.busy = true; this.phase = '启动任务'; this.turnStartedAt = startedAt; this.lastActivityAt = startedAt; this.stopRequested = false;
-    this.messages.push({ role: 'user', text: input, id: this.inFlight.messageId }); this.sync();
+    this.sync();
     try {
       if (this.stopRequested) { this.restoreInFlight(); this.busy = false; this.sync(); return; }
       const id = await this.getAgent().prompt(input, this.selectedModel?.model, this.selectedModel?.modelProviderId ?? undefined, this.selectedReasoning, this.selectedMode, permissionsFor(this.permissionMode, this.cliOptions().cwd), this.attachmentsForSend());
@@ -398,7 +413,7 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     if (host.current.transition) return;
     host.current.stashDraft();
     const session = host.createSession();
-    session.permissionMode = host.current.permissionMode; session.selectedModel = host.current.selectedModel; session.selectedReasoning = host.current.selectedReasoning; session.reasoningOptions = host.current.reasoningOptions; session.selectedMode = host.current.selectedMode; session.modeOptions = host.current.modeOptions;
+    session.permissionMode = host.current.permissionMode; session.selectedModel = host.current.selectedModel; session.modelLoad = host.current.modelLoad; session.selectedReasoning = host.current.selectedReasoning; session.reasoningOptions = host.current.reasoningOptions; session.selectedMode = host.current.selectedMode; session.modeOptions = host.current.modeOptions;
     host.liveSessions.add(session); host.current = session; host.page = 'chat';
     host.fullSync = true; host.sync(true);
   }
@@ -483,6 +498,8 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
       const models = (await this.getAgent().models()).data.filter(model => !model.hidden);
       if (epoch !== this.epoch) return;
       if (id === undefined) {
+        const current = this.selectedModel ? models.find(model => model.model === this.selectedModel?.model && model.modelProviderId === this.selectedModel?.modelProviderId) : models.find(model => model.isDefault);
+        if (current) this.rememberModelLoad(current);
         this.postToSession({ type: 'models', models: models.map(model => ({ id: model.id, label: model.displayName, description: model.description, selected: model.model === this.selectedModel?.model && model.modelProviderId === this.selectedModel?.modelProviderId })) });
         return;
       }
@@ -573,12 +590,43 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     } catch (error) { this.postToSession({type:'reasoningLevels', options:[], error:'加载推理等级失败，请重试。'}); this.output.appendLine(String(error)); }
   }
   private applyModeCatalog(model: Model) {
+    this.rememberModelLoad(model);
     this.modeOptions = modelModes(model);
     const mode = resolveMode(this.modeOptions, this.selectedMode);
     this.selectedMode = mode?.id;
     this.reasoningOptions = mode?.reasoning ?? model.supportedReasoningEfforts ?? [];
     const defaultEffort = mode?.defaultReasoning ?? model.defaultReasoningEffort;
     if (!this.reasoningOptions.some(option => option.reasoningEffort === this.selectedReasoning)) this.selectedReasoning = this.reasoningOptions.find(option => option.reasoningEffort === defaultEffort)?.reasoningEffort ?? this.reasoningOptions[0]?.reasoningEffort;
+  }
+  private rememberModelLoad(model: Model) {
+    const load = model.businessMetadata?.load;
+    if (!load) { this.modelLoad = undefined; return; }
+    const queueSize = load.queue_size === null ? undefined : Number(load.queue_size);
+    const validQueueSize = queueSize !== undefined && Number.isSafeInteger(queueSize) && queueSize >= 0;
+    this.modelLoad = { percent: Math.max(0, Math.min(100, Math.round(load.load_percent))), ...(validQueueSize ? { queueSize } : {}) };
+  }
+  private async refreshModelLoad(turnId: string) {
+    const epoch = this.epoch;
+    try {
+      const models = (await this.getAgent().models()).data;
+      if (epoch !== this.epoch || this.queueStatus?.turnId !== turnId) return;
+      const model = this.selectedModel ? models.find(model => model.model === this.selectedModel?.model && model.modelProviderId === this.selectedModel?.modelProviderId) : models.find(model => model.isDefault);
+      if (model) this.rememberModelLoad(model);
+      const queue = this.queueStatus;
+      if (queue?.turnId === turnId) { this.phase = this.queuePhase(queue.state, queue.position, queue.message, queue.operation); this.sync(); }
+    } catch (error) { if (this.queueLoadTurnId === turnId) this.queueLoadTurnId = undefined; this.output.appendLine(`读取模型负载失败：${String(error)}`); }
+  }
+  private queuePhase(state: string, position: number | null, message: string | null, operation: string | null) {
+    const parts: string[] = [];
+    if (!operation && this.modelLoad) parts.push(`模型负载 ${this.modelLoad.percent}%`);
+    const subject = operation === 'contextCompaction' ? '上下文压缩' : '';
+    if (state === 'ready') parts.push(`${subject}排队完成，正在启动`);
+    else if (state === 'queued' || state === 'waiting') {
+      parts.push(`${subject}排队中`);
+      if (position !== null) parts.push(`队列第 ${Math.max(1, position)} 位`);
+      else if (!operation && this.modelLoad?.queueSize) parts.push(`当前约 ${this.modelLoad.queueSize} 个请求`);
+    } else parts.push(message || `${subject}队列状态：${state}`);
+    return parts.join(' · ');
   }
   private async chooseMode(id?: string) {
     if (this.transition) return;

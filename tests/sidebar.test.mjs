@@ -21,9 +21,11 @@ await test('send snapshots draft and attachments before asynchronous preflight',
  sidebar.agent={prompt:async text=>{submitted=text;return 'thread';},dispose(){}};
  try {
   const sending=sidebar.send('first');await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(sidebar.transition,true);assert.equal(sidebar.phase,'准备请求');assert.ok(sidebar.turnStartedAt);
+  assert.deepEqual(sidebar.messages.map(message=>[message.role,message.text]),[['user','first\n\nA']]);
   sidebar.draft='next draft';sidebar.attachments.push({id:'b',label:'B',text:'B'});
   releaseAuth(true);await sending;
-  assert.equal(submitted,'first\n\nA');assert.equal(sidebar.draft,'next draft');assert.deepEqual(sidebar.attachments.map(item=>item.id),['b']);
+  assert.equal(submitted,'first\n\nA');assert.equal(sidebar.draft,'next draft');assert.deepEqual(sidebar.attachments.map(item=>item.id),['b']);assert.equal(sidebar.messages.filter(message=>message.role==='user').length,1);
  }finally{sidebar.dispose();}
 });
 await test('unsent new-session drafts use a stable reload key',async()=>{
@@ -225,6 +227,17 @@ await test('completed live sessions keep their latest activity ordering',()=>{
   assert.equal(sidebar.sessionRows().find(row=>row.id==='live').updatedAt,activeTime);assert.ok(activeTime>100);
  }finally{sidebar.dispose();}
 });
+await test('queue status uses the existing task line with model load and position',async()=>{
+ const sidebar=controller();sidebar.threadId='live';sidebar.busy=true;sidebar.agent={models:async()=>({data:[{isDefault:true,businessMetadata:{load:{load_percent:92,queue_size:8}}}]}),dispose(){}};
+ try {
+  sidebar.update({method:'queue/status',params:{threadId:'live',turnId:'turn',state:'waiting',operation:null,position:3,message:null}});
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(sidebar.phase,'模型负载 92% · 排队中 · 队列第 3 位');assert.ok(sidebar.turnStartedAt);
+  sidebar.update({method:'queue/status',params:{threadId:'live',turnId:'turn',state:'ready',operation:null,position:null,message:null}});
+  assert.equal(sidebar.phase,'模型负载 92% · 排队完成，正在启动');
+  sidebar.update({method:'turn/started',params:{threadId:'live',turn:{id:'turn',status:'inProgress',items:[]}}});assert.equal(sidebar.phase,'模型处理中');
+ }finally{sidebar.dispose();}
+});
 await test('slash option lists use model catalog and permissions; skills become structured attachments',async()=>{
  const sidebar=controller();const responses=[];sidebar.postToSession=message=>responses.push(message);
  sidebar.agent={models:async()=>({data:[{id:'m',model:'model',displayName:'Model',modelProviderId:'p',description:'demo',hidden:false,isDefault:true,supportedReasoningEfforts:[{reasoningEffort:'high',description:'deep'}],defaultReasoningEffort:'high'}]}),skills:async()=>({data:[{skills:[{name:'demo',path:'/tmp/skill.md',description:'skill',enabled:true},{name:'off',path:'/tmp/off.md',enabled:false}]}]}),dispose(){}};
@@ -249,6 +262,13 @@ await test('reasoning details survive late item start and process statuses finis
   assert.equal(sidebar.messages[0].detail,'thinking details');assert.equal(sidebar.messages[0].status,'inProgress');
   sidebar.update({method:'turn/completed',params:{threadId:'t',turn:{id:'turn',status:'completed',error:null}}});
   assert.equal(sidebar.messages[0].status,'completed');
+ }finally{sidebar.dispose();}
+});
+await test('plan updates are identified separately from active tool calls',()=>{
+ const sidebar=controller();sidebar.threadId='t';
+ try {
+  sidebar.update({method:'turn/plan/updated',params:{threadId:'t',turnId:'turn',explanation:null,source:null,plan:[{step:'修复问题',status:'inProgress'}]}});
+  assert.equal(sidebar.messages[0].processKind,'plan');assert.equal(sidebar.messages[0].toolName,'计划');assert.equal(sidebar.messages[0].status,'inProgress');
  }finally{sidebar.dispose();}
 });
 await test('raw reasoning events create a live process without exposing hidden reasoning text',()=>{

@@ -21,6 +21,17 @@ taskStatus.classList.add('task-status');
 if (document.getElementById('composer').contains(taskStatus)) document.getElementById('composer').before(taskStatus);
 function refreshStatus() { const elapsed = startedAt ? ` · ${Math.floor((Date.now() - startedAt) / 1000)}秒` : ''; taskStatus.textContent = busy ? phase + elapsed : ''; }
 setInterval(refreshStatus, 1000);
+function processActivityLabel(value = '') {
+  if (/等待授权/.test(value)) return '等待授权';
+  if (/排队/.test(value)) return '排队中';
+  if (/生成回复/.test(value)) return '生成回复中';
+  if (/执行命令/.test(value)) return '执行命令中';
+  if (/修改文件/.test(value)) return '修改文件中';
+  if (/停止/.test(value)) return '正在停止';
+  if (/启动|准备|连接|登录/.test(value)) return '正在启动';
+  if (/思考/.test(value)) return '思考中';
+  return '模型处理中';
+}
 const nodes = new Map();
 const processGroups = new Map();
 const processOpen = new Map();
@@ -425,6 +436,13 @@ window.addEventListener('message', ({ data }) => {
   const all = [...store.values()];
   const end = windowEnd ?? all.length;
   const visible = all.slice(Math.max(0, end - 200), end);
+  let latestUserIndex = visible.findLastIndex(message => message.role === 'user');
+  const taskInProgress = !!data.busy || !!data.transition;
+  const hasCurrentProcess = visible.slice(latestUserIndex + 1).some(message => message.role === 'tool' && message.process !== false);
+  if (taskInProgress && end === all.length && latestUserIndex >= 0 && !hasCurrentProcess) {
+    visible.splice(latestUserIndex + 1, 0, { id: `activity-${data.viewKey ?? 'chat'}`, role: 'tool', text: '任务状态', status: 'inProgress', processKind: 'activity' });
+  }
+  latestUserIndex = visible.findLastIndex(message => message.role === 'user');
   let pager = messages.querySelector('.pager');
   if (!pager) { pager = element('div', 'pager'); messages.prepend(pager); }
   pager.replaceChildren();
@@ -490,7 +508,8 @@ window.addEventListener('message', ({ data }) => {
   let previous = pager;
   let currentProcess, currentProcessEntry, lastProcessNode;
   const usedProcesses = new Map();
-  for (const message of visible) {
+  for (let messageIndex = 0; messageIndex < visible.length; messageIndex++) {
+    const message = visible[messageIndex];
     const isProcess = message.role === 'tool' && message.process !== false;
     if (isProcess && !currentProcess) {
       const key = `${viewKey ?? 'chat'}:${message.id}`;
@@ -505,15 +524,14 @@ window.addEventListener('message', ({ data }) => {
       }
       if (previous.nextSibling !== group) messages.insertBefore(group, previous.nextSibling);
       previous = group; currentProcess = group; lastProcessNode = undefined;
-      currentProcessEntry={group,steps:[]};usedProcesses.set(key,currentProcessEntry);
+      currentProcessEntry={group,steps:[],startIndex:messageIndex};usedProcesses.set(key,currentProcessEntry);
     } else if (!isProcess) {currentProcess=undefined;currentProcessEntry=undefined;lastProcessNode=undefined;}
     if (isProcess) currentProcessEntry.steps.push(message);
 
     let node = nodes.get(message.id);
     if (!node) {
       node = element('article', message.role);
-      if (message.role === 'tool') { const details = element('details', 'tool-details'); details.append(element('summary', 'tool-title'), element('pre', 'detail'), element('div', 'files')); node.append(details); }
-      else { node.append(element('div', 'content')); if (message.role === 'assistant') { const copy = element('button', 'copy', '复制'); copy.onclick = () => post({ type: 'copy', text: store.get(message.id)?.text ?? '' }); node.append(copy); } }
+      if (message.role !== 'tool') { node.append(element('div', 'content')); if (message.role === 'assistant') { const copy = element('button', 'copy', '复制'); copy.onclick = () => post({ type: 'copy', text: store.get(message.id)?.text ?? '' }); node.append(copy); } }
       nodes.set(message.id, node);
     }
     if (isProcess) {
@@ -528,25 +546,44 @@ window.addEventListener('message', ({ data }) => {
     const signature = JSON.stringify(message);
     if (node.dataset.signature !== signature) {
       if (message.role === 'tool') {
-        node.querySelector('.tool-title').textContent = `${message.status === 'inProgress' ? '◌' : message.status === 'failed' ? '!' : '›'} ${message.text}${message.status ? ` · ${statusNames[message.status] ?? message.status}` : ''}`;
-        node.querySelector('.detail').textContent = message.detail ?? '';
-        const files = node.querySelector('.files'); files.replaceChildren();
-        for (const path of message.paths ?? []) { const button = element('button', '', path.split(/[\\/]/).pop()); button.title = path; button.onclick = () => post({ type: 'reviewFile', id: message.id, path }); files.append(button); }
+        const emptyReasoning=message.processKind==='reasoning'&&!message.reasoningHasSummary&&!message.detail;
+        if(emptyReasoning) {
+          let title=node.querySelector('.tool-static');
+          if(!title) {title=element('div','tool-title tool-static');node.replaceChildren(title);}
+          title.textContent=`思考${message.status ? ` · ${statusNames[message.status] ?? message.status}` : ''}`;
+        } else {
+          let details=node.querySelector('.tool-details');
+          if(!details) {details=element('details','tool-details');details.append(element('summary','tool-title'),element('pre','detail'),element('div','files'));node.replaceChildren(details);}
+          details.querySelector('.tool-title').textContent = `${message.status === 'inProgress' ? '◌' : message.status === 'failed' ? '!' : '›'} ${message.text}${message.status ? ` · ${statusNames[message.status] ?? message.status}` : ''}`;
+          details.querySelector('.detail').textContent = message.detail ?? '';
+          const files = details.querySelector('.files'); files.replaceChildren();
+          for (const path of message.paths ?? []) { const button = element('button', '', path.split(/[\\/]/).pop()); button.title = path; button.onclick = () => post({ type: 'reviewFile', id: message.id, path }); files.append(button); }
+        }
       } else { const body = node.querySelector('.content'); if (message.role === 'assistant') { if (message.status === 'streaming' || streams.has(message.id)) queueStream(node, message); else finishMarkdown(body, message.text); } else body.textContent = message.text; }
       node.dataset.signature = signature;
     }
   }
+  const processEntries=[...usedProcesses.values()];
+  const currentProcessEntries=processEntries.filter(entry=>latestUserIndex<0||entry.startIndex>latestUserIndex);
+  const waitingForApproval=/等待授权/.test(phase);
+  const foregroundProcess=waitingForApproval ? undefined : currentProcessEntries.findLast(entry=>entry.steps.some(step=>step.status==='inProgress'&&!['plan','activity'].includes(step.processKind)));
+  const fallbackProcess=taskInProgress ? currentProcessEntries.at(-1) : undefined;
   for(const [key,{group,steps}] of usedProcesses) {
-    const activeStep=steps.findLast(step=>step.status==='inProgress');
-    const active=!!activeStep;
-    const label=activeStep ? (activeStep.processKind==='reasoning'||activeStep.text==='思考摘要' ? '思考中' : '调用工具 '+(activeStep.toolName || activeStep.text)) : '思考与工具调用';
+    const pendingStep=steps.findLast(step=>step.status==='inProgress'&&!['plan','activity'].includes(step.processKind));
+    const activeStep=foregroundProcess?.group===group ? pendingStep : undefined;
+    const fallbackActive=!foregroundProcess&&fallbackProcess?.group===group;
+    const active=!!activeStep||(fallbackActive&&!waitingForApproval);
+    const backgroundActive=!!pendingStep&&!active;
+    const label=activeStep ? (activeStep.processKind==='reasoning'||activeStep.text==='思考摘要' ? '思考中' : '调用工具 '+(activeStep.toolName || activeStep.text)) : fallbackActive ? processActivityLabel(phase) : '思考与工具调用';
     group.querySelector('.process-label').textContent=label;
-    group.querySelector('.process-summary').title=activeStep ? activeStep.text : '点击展开查看思考与工具调用详情';
+    group.querySelector('.process-summary').title=activeStep ? activeStep.text : fallbackActive ? processActivityLabel(phase) : '点击展开查看思考与工具调用详情';
     const failed=steps.some(step=>step.status==='failed');
     const stopped=steps.some(step=>['interrupted','declined'].includes(step.status));
-    const status=active?'进行中':failed?'有步骤失败':stopped?'已停止':steps.every(step=>step.status==='completed')?'已完成':'已记录';
-    group.querySelector('.process-meta').textContent=`${steps.length} 项 · ${status}`;
-    group.dataset.status=active?'inProgress':failed?'failed':'completed';
+    const status=fallbackActive&&waitingForApproval?'等待授权':active?'进行中':backgroundActive?'后台进行中':failed?'有步骤失败':stopped?'已停止':steps.every(step=>step.status==='completed')?'已完成':'已记录';
+    const realSteps=steps.filter(step=>step.processKind!=='activity');
+    group.querySelector('.process-meta').textContent=`${realSteps.length ? `${realSteps.length} 项 · ` : ''}${status}`;
+    group.querySelector('.process-items').hidden=!realSteps.length;
+    group.dataset.status=active?'inProgress':fallbackActive&&waitingForApproval?'waiting':backgroundActive?'background':failed?'failed':'completed';
   }
   for(const [key,group] of processGroups) if(!usedProcesses.has(key)) {group.remove();processGroups.delete(key);}
   const approvalSignature = JSON.stringify(data.approvals);

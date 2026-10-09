@@ -13,7 +13,7 @@ import type { ModelListResponse } from './protocol/v2/ModelListResponse';
 export class Agent {
   private child?: ChildProcessWithoutNullStreams;
   private ready?: Promise<void>;
-  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; method: string; timer?: NodeJS.Timeout }>();
   private nextId = 0;
   private disposed = false;
   private threadId?: string;
@@ -22,7 +22,7 @@ export class Agent {
   private defaultPermissions?: Permissions;
   private transport = 0;
   private completedTurns = new Set<string>();
-  constructor(private options: { executable: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; update: (event: ServerNotification) => void; request: (request: ServerRequest) => Promise<unknown>; log: (text: string) => void; exited: () => void; status?: (status: string) => void }) {}
+  constructor(private options: { executable: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; update: (event: ServerNotification) => void; request: (request: ServerRequest) => Promise<unknown>; log: (text: string) => void; exited: () => void; status?: (status: string) => void; rpcTimeoutMs?: number; queuedTurnTimeoutMs?: number }) {}
   private initialize() {
     if (this.disposed) return Promise.reject(new Error('会话已关闭'));
     if (!this.ready) this.ready = this.connect().catch(error => {
@@ -55,6 +55,11 @@ export class Agent {
           void this.options.request(message as ServerRequest).then(result => { if (transport === this.transport) this.write({ id, result }); }, error => { if (transport === this.transport) this.write({ id, error: { code: -32603, message: String(error) } }); });
         } else {
           const event = message as ServerNotification;
+          if (event.method === 'queue/status' && event.params.threadId === this.threadId) {
+            if (['queued', 'waiting', 'ready'].includes(event.params.state)) this.turnId = event.params.turnId;
+            const timeout = ['queued', 'waiting'].includes(event.params.state) ? this.options.queuedTurnTimeoutMs ?? 10 * 60 * 1000 : this.options.rpcTimeoutMs ?? 30000;
+            for (const [id, pending] of this.pending) if (pending.method === 'turn/start') this.armTimeout(id, timeout);
+          }
           if (event.method === 'turn/started' && event.params.threadId === this.threadId) this.turnId = event.params.turn.id;
           if (event.method === 'turn/completed') { this.completedTurns.add(event.params.turn.id); if (event.params.threadId === this.threadId) this.turnId = undefined; }
           this.options.update(event);
@@ -66,16 +71,27 @@ export class Agent {
       }
     });
     await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-    await this.rpc('initialize', { clientInfo: { name: 'traecli-vscode', title: 'TRAE CLI Sidebar', version: '0.14.2' }, capabilities: { experimentalApi: false } });
+    await this.rpc('initialize', { clientInfo: { name: 'traecli-vscode', title: 'TRAE CLI Sidebar', version: '0.14.6' }, capabilities: { experimentalApi: false } });
     this.write({ method: 'initialized', params: {} });
     this.options.status?.('已连接');
   }
   private write(message: unknown) { if (!this.disposed && this.child?.stdin.writable) this.child.stdin.write(JSON.stringify(message) + '\n'); }
+  private armTimeout(id: number, delay: number) {
+    const pending = this.pending.get(id); if (!pending) return;
+    clearTimeout(pending.timer);
+    pending.timer = setTimeout(() => {
+      if (this.pending.get(id) !== pending) return;
+      this.pending.delete(id); this.options.status?.('请求超时，请重新连接');
+      const error = new Error(`${pending.method} 超时，请重新连接确认任务状态`);
+      if (pending.method === 'turn/start') error.name = 'TurnStartUncertain';
+      pending.reject(error);
+    }, delay);
+  }
   private rpc<T>(method: string, params: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
       const id = ++this.nextId;
-      const timer = setTimeout(() => { this.pending.delete(id); this.options.status?.('请求超时，请重新连接'); const error = new Error(`${method} 超时，请重新连接确认任务状态`); if (method === 'turn/start') error.name = 'TurnStartUncertain'; reject(error); }, 30000);
-      this.pending.set(id, { resolve: value => resolve(value as T), reject, timer }); this.write({ id, method, params });
+      this.pending.set(id, { resolve: value => resolve(value as T), reject, method });
+      this.armTimeout(id, this.options.rpcTimeoutMs ?? 30000); this.write({ id, method, params });
     });
   }
   private fail(error: Error) { for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); } this.pending.clear(); }

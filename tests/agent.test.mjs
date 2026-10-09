@@ -42,6 +42,11 @@ await test('model mode uses modelBackendVariant and does not send serviceTier',a
  const agent=new Agent({executable:process.execPath,args:[resolve('tests/mock-server.cjs')],cwd:process.cwd(),env:process.env,update:event=>events.push(event),request:async()=>({decision:'decline'}),log:()=>{},exited:()=>{}});
  try{await agent.prompt('test',undefined,undefined,undefined,'sol__max');await new Promise(resolve=>setTimeout(resolve,30));assert.ok(events.some(event=>event.method==='item/agentMessage/delta'&&event.params.delta==='mode:sol__max'));}finally{agent.dispose();}
 });
+await test('queue status extends the turn start timeout',async()=>{
+ const events=[];
+ const agent=new Agent({executable:process.execPath,args:[resolve('tests/mock-server.cjs')],cwd:process.cwd(),env:{...process.env,TRAE_TEST_QUEUE:'1'},queuedTurnTimeoutMs:150,update:event=>events.push(event),request:async()=>({decision:'decline'}),log:()=>{},exited:()=>{}});
+ try{await agent.models();agent.options.rpcTimeoutMs=20;assert.equal(await agent.prompt('queued'),'thread-test');assert.ok(events.some(event=>event.method==='queue/status'&&event.params.position===3));}finally{agent.dispose();}
+});
 await test('permission overrides reach the CLI and default restores the original policy',async()=>{
  const events=[];
  const agent=new Agent({executable:process.execPath,args:[resolve('tests/mock-server.cjs')],cwd:process.cwd(),env:{...process.env,TRAE_TEST_PERMISSIONS:'1'},update:event=>events.push(event),request:async()=>({decision:'decline'}),log:()=>{},exited:()=>{}});

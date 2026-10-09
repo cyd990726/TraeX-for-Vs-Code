@@ -162,6 +162,7 @@ textarea { resize: none; line-height: 1.5; min-height: calc(3em + 15px); padding
 .process-items {margin:4px 0 5px 7px;padding-left:8px;border-left:1px solid var(--vscode-panel-border);}
 .process-items .tool-title {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .process-items .tool-details[open] .tool-title {white-space:normal;overflow-wrap:anywhere;}
+.process-items .tool-static {cursor:default;}
 
 .process-indicator {display:none;width:10px;height:10px;flex-shrink:0;border:1.5px solid currentColor;border-right-color:transparent;border-radius:50%;}
 .process-group[data-status=inProgress]>.process-summary .process-indicator {display:inline-block;animation:process-spin 1s linear infinite;}
@@ -170,5 +171,4 @@ textarea { resize: none; line-height: 1.5; min-height: calc(3em + 15px); padding
 @keyframes process-pulse {0%,100% {opacity:1;}50% {opacity:.55;}}
 @media(prefers-reduced-motion:reduce) {.process-group[data-status=inProgress]>.process-summary .process-indicator,.process-group[data-status=inProgress]>.process-summary .process-label {animation:none;}}
 
-article.user {width:fit-content;max-width:88%;min-width:3.5em;margin-left:auto;}
-@media(max-width:320px) {article.user {max-width:94%;}}
+article.user {width:fit-content;max-width:min(100%,calc(100vw * 2 / 3));min-width:3.5em;margin-left:auto;}
