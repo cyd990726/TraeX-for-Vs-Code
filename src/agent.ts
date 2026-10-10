@@ -9,6 +9,8 @@ import type { ThreadListResponse } from './protocol/v2/ThreadListResponse';
 import type { Permissions } from './permissions';
 import type { ReasoningEffort } from './protocol/ReasoningEffort';
 import type { ModelListResponse } from './protocol/v2/ModelListResponse';
+import type { ModeChangeDecision } from './protocol/v2/ModeChangeDecision';
+import type { ModeChangeRespondResponse } from './protocol/v2/ModeChangeRespondResponse';
 
 export class Agent {
   private child?: ChildProcessWithoutNullStreams;
@@ -22,6 +24,8 @@ export class Agent {
   private defaultPermissions?: Permissions;
   private transport = 0;
   private completedTurns = new Set<string>();
+  private activeServerRequests = new Set<string>();
+  private resolvedServerRequests = new Set<string>();
   constructor(private options: { executable: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; update: (event: ServerNotification) => void; request: (request: ServerRequest) => Promise<unknown>; log: (text: string) => void; exited: () => void; status?: (status: string) => void; rpcTimeoutMs?: number; queuedTurnTimeoutMs?: number }) {}
   private initialize() {
     if (this.disposed) return Promise.reject(new Error('会话已关闭'));
@@ -38,6 +42,8 @@ export class Agent {
   }
   private async connect() {
     const transport = ++this.transport;
+    this.activeServerRequests.clear();
+    this.resolvedServerRequests.clear();
     this.options.status?.('正在连接');
     const child = spawn(this.options.executable, [...this.options.args, 'app-server', '--stdio'], { cwd: this.options.cwd, env: this.options.env, stdio: 'pipe', windowsHide: true });
     this.child = child;
@@ -52,13 +58,25 @@ export class Agent {
       if (message.method) {
         if (message.id !== undefined) {
           const id = message.id;
-          void this.options.request(message as ServerRequest).then(result => { if (transport === this.transport) this.write({ id, result }); }, error => {
+          const requestKey = String(id);
+          this.activeServerRequests.add(requestKey);
+          void this.options.request(message as ServerRequest).then(result => {
+            this.activeServerRequests.delete(requestKey);
+            if (transport !== this.transport || this.resolvedServerRequests.delete(requestKey)) return;
+            this.write({ id, result });
+          }, error => {
+            this.activeServerRequests.delete(requestKey);
             if (transport !== this.transport) return;
+            if (this.resolvedServerRequests.delete(requestKey)) return;
             const code = typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'number' ? error.code : -32603;
             this.write({ id, error: { code, message: error instanceof Error ? error.message : String(error) } });
           });
         } else {
           const event = message as ServerNotification;
+          if (event.method === 'serverRequest/resolved') {
+            const requestKey = String(event.params.requestId);
+            if (this.activeServerRequests.has(requestKey)) this.resolvedServerRequests.add(requestKey);
+          }
           if (event.method === 'queue/status' && event.params.threadId === this.threadId) {
             if (event.params.operation !== 'contextCompaction' && ['queued', 'waiting', 'ready'].includes(event.params.state)) this.turnId = event.params.turnId;
             const timeout = event.params.operation === 'contextCompaction' || ['queued', 'waiting'].includes(event.params.state) ? this.options.queuedTurnTimeoutMs ?? 10 * 60 * 1000 : this.options.rpcTimeoutMs ?? 30000;
@@ -80,7 +98,7 @@ export class Agent {
       }
     });
     await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-    await this.rpc('initialize', { clientInfo: { name: 'traecli-vscode', title: 'TRAE CLI Sidebar', version: '0.14.9' }, capabilities: { experimentalApi: false } });
+    await this.rpc('initialize', { clientInfo: { name: 'traecli-vscode', title: 'TRAE CLI Sidebar', version: '0.14.10' }, capabilities: { experimentalApi: false } });
     this.write({ method: 'initialized', params: {} });
     this.options.status?.('已连接');
   }
@@ -108,6 +126,7 @@ export class Agent {
   async skills() { await this.initialize(); return this.rpc<{data:{cwd:string;skills:{name:string;description:string;path:string;enabled:boolean}[]}[]}>('skills/list', {cwds:[this.options.cwd],forceReload:true}); }
   async compact(guidance?: string) { await this.initialize(); if (!this.threadId) throw new Error('请先开始一个会话'); return this.rpc('thread/compact/start', {threadId:this.threadId,...(guidance ? {userGuidance:guidance} : {})}, this.options.queuedTurnTimeoutMs ?? 10 * 60 * 1000); }
   async models() { await this.initialize(); return this.rpc<ModelListResponse>('model/list', {}); }
+  async respondModeChange(threadId: string, requestId: string, decision: ModeChangeDecision) { await this.initialize(); return this.rpc<ModeChangeRespondResponse>('mode/change/respond', {threadId,requestId,decision}); }
   async resume(threadId: string) { await this.initialize(); const result = await this.rpc<ThreadResumeResponse>('thread/resume', { threadId, cwd: this.options.cwd }); this.defaultPermissions = result.approvalPolicy && result.sandbox ? {approvalPolicy:result.approvalPolicy,sandboxPolicy:result.sandbox} : undefined; this.threadId = result.thread.id; this.turnId = result.thread.turns.find(turn => turn.status === 'inProgress')?.id; this.completedTurns.clear(); return result; }
   newThread() { this.threadId = undefined; this.turnId = undefined; this.completedTurns.clear(); }
   async prompt(text: string, model?: string, modelProvider?: string, effort?: ReasoningEffort, modelBackendVariant?: string, permissions?: Permissions, skills?: {name:string;path:string}[]) {
@@ -125,5 +144,5 @@ export class Agent {
     return this.threadId;
   }
   async cancel() { this.cancelled = true; if (this.threadId && this.turnId) await this.rpc('turn/interrupt', { threadId: this.threadId, turnId: this.turnId }); }
-  dispose() { this.disposed = true; ++this.transport; this.fail(new Error('连接已关闭')); this.child?.kill(); }
+  dispose() { this.disposed = true; ++this.transport; this.activeServerRequests.clear(); this.resolvedServerRequests.clear(); this.fail(new Error('连接已关闭')); this.child?.kill(); }
 }

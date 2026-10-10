@@ -7,7 +7,7 @@
 需要 VS Code 1.104+，以及支持 `traecli app-server --stdio` 的 CLI（本机验证版本为 0.208.1）。
 
 1. 安装 TRAE CLI。插件会自动检查登录状态；未登录时点击“去登录”，在 VS Code 终端完成官方登录流程，成功后自动刷新会话列表。也可自行运行 `traecli login`，然后点击“我已登录，重新检测”。
-2. 扩展面板右上角 `…` → “从 VSIX 安装”，选择 `traecli-sidebar-0.14.9.vsix`，更新后重载窗口。
+2. 扩展面板右上角 `…` → “从 VSIX 安装”，选择 `traecli-sidebar-0.14.10.vsix`，更新后重载窗口。
 3. 打开并信任项目，点击编辑器顶部右侧 TRAE 图标。关闭辅助边栏后，顶部入口仍可使用。
 
 未打开文件时，可运行命令 `TRAE CLI: Open Chat`。辅助边栏可通过“视图 → 外观 → 辅助边栏”显示。工具栏被隐藏时检查 `workbench.editor.editorActionsLocation`。

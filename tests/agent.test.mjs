@@ -13,6 +13,7 @@ await test('app-server handles history, resume, streaming, approval and interrup
  try {
   assert.deepEqual((await agent.history()).data,[]);
   assert.equal((await agent.models()).data[0].model,'test-model');
+  assert.deepEqual(await agent.respondModeChange('saved-thread','mode-request','approved'),{threadId:'saved-thread',requestId:'mode-request',decision:'approved'});
   assert.equal((await agent.resume('saved-thread')).thread.id,'saved-thread');
   agent.newThread();
   assert.equal(await agent.prompt('test'),'thread-test');
@@ -22,6 +23,11 @@ await test('app-server handles history, resume, streaming, approval and interrup
   assert.ok(events.some(event=>event.method==='item/completed' && event.params.item.aggregatedOutput==='decline'));
   assert.ok(events.some(event=>event.method==='turn/completed' && event.params.turn.status==='interrupted'));
  } finally {agent.dispose();}
+});
+await test('externally resolved server requests do not write a duplicate response',async()=>{
+ const events=[];let release;
+ const agent=new Agent({executable:process.execPath,args:[resolve('tests/mock-server.cjs')],cwd:process.cwd(),env:{...process.env,TRAE_TEST_EXTERNAL_RESOLVE:'1'},update:event=>{events.push(event);if(event.method==='serverRequest/resolved')release?.({decision:'decline'});},request:()=>new Promise(resolve=>release=resolve),log:()=>{},exited:()=>{}});
+ try {await agent.prompt('test');await new Promise(resolve=>setTimeout(resolve,30));assert.ok(events.some(event=>event.method==='serverRequest/resolved'));assert.ok(!events.some(event=>event.method==='item/completed'));}finally{agent.dispose();}
 });
 await test('startup failure rejects instead of hanging',async()=>{
  const agent=new Agent({executable:'/does-not-exist/traecli',args:[],cwd:process.cwd(),env:process.env,update:()=>{},request:async()=>({}),log:()=>{},exited:()=>{}});

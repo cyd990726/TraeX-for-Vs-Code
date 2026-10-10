@@ -295,6 +295,10 @@ await test('approval requests expose protocol-specific choices and return valid 
   assert.deepEqual(pending.choices.find(choice=>choice.id==='remember-command').response,{decision:{acceptWithExecpolicyAmendment:{execpolicy_amendment:['curl','*']}}});
   assert.equal(sidebar.resolveApproval('command','invented'),false);assert.equal(sidebar.approvals.has('command'),true);
   assert.equal(sidebar.resolveApproval('command','accept-session'),true);assert.deepEqual(await command,{decision:'acceptForSession'});
+  const restricted=sidebar.request({id:'restricted',method:'item/commandExecution/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'restricted-item',startedAtMs:Date.now(),command:'curl https://internal.example',cwd:'/tmp',additionalPermissions:{network:{enabled:true},fileSystem:{read:['/outside'],write:null}},availableDecisions:['accept','decline']}});
+  pending=sidebar.approvals.get('restricted');assert.deepEqual(pending.choices.map(choice=>choice.id),['accept','decline']);assert.match(pending.detail,/额外权限/);assert.match(pending.detail,/outside/);
+  sidebar.resolveApproval('restricted','decline');assert.deepEqual(await restricted,{decision:'decline'});
+  await assert.rejects(sidebar.request({id:'no-decisions',method:'item/commandExecution/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'no-decisions-item',startedAtMs:Date.now(),command:'echo test',availableDecisions:[]}}),error=>error.code===-32602);
   const file=sidebar.request({id:'file',method:'item/fileChange/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'file-item',startedAtMs:Date.now(),reason:'写入配置',grantRoot:'/tmp/project'}});
   assert.deepEqual(sidebar.approvals.get('file').choices.map(choice=>choice.label),['允许一次','本会话允许','拒绝并继续','拒绝并停止']);sidebar.resolveApproval('file','cancel');assert.deepEqual(await file,{decision:'cancel'});
   const permission=sidebar.request({id:'permissions',method:'item/permissions/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'permission-item',environmentId:null,startedAtMs:Date.now(),cwd:'/tmp',reason:'需要联网',permissions:{network:{enabled:true},fileSystem:null}}});
@@ -308,7 +312,26 @@ await test('approval requests expose protocol-specific choices and return valid 
   sidebar.clearApprovals();assert.deepEqual(await legacyDenied,{decision:{denied:{rejection:'用户拒绝了命令执行'}}});
   const form=await sidebar.request({id:'mcp',method:'mcpServer/elicitation/request',params:{threadId:'t',turnId:'turn',serverName:'demo',mode:'form',_meta:null,message:'配置',requestedSchema:{type:'object',required:['enabled'],properties:{enabled:{type:'boolean',title:'启用'},name:{type:'string',title:'名称',default:'demo'}}}}});
   assert.deepEqual(form,{action:'accept',content:{enabled:true,name:'demo'}});
+  const before=Math.floor(Date.now()/1000);const time=await sidebar.request({id:'time',method:'currentTime/read',params:{threadId:'t'}});assert.ok(time.currentTimeAt>=before&&time.currentTimeAt<=Math.floor(Date.now()/1000));
   await assert.rejects(sidebar.request({id:'tool',method:'item/tool/call',params:{threadId:'t',turnId:'turn',callId:'call',namespace:null,tool:'missing',arguments:{}}}),error=>error.code===-32601&&/未注册动态工具/.test(error.message));
+ } finally {sidebar.dispose();}
+});
+await test('request user input preserves multi-select and optional other answers',async()=>{
+ const sidebar=controller();
+ try {
+  const result=await sidebar.request({id:'questions',method:'item/tool/requestUserInput',params:{threadId:'t',turnId:'turn',itemId:'question-item',isBlocking:true,questions:[{id:'targets',header:'目标',question:'选择目标',isOther:true,isSecret:false,multiSelect:true,options:[{label:'A',description:'a',preview:null},{label:'B',description:'b',preview:null}]}]}});
+  assert.deepEqual(result,{answers:{targets:{answers:['A','typed answer']}}});
+ } finally {sidebar.dispose();}
+});
+await test('resolved requests disappear and mode changes respond exactly once',async()=>{
+ const sidebar=controller();const responses=[];sidebar.threadId='t';sidebar.busy=true;sidebar.agent={respondModeChange:async(...args)=>responses.push(args),dispose(){}};
+ try {
+  const command=sidebar.request({id:'external',method:'item/commandExecution/requestApproval',params:{threadId:'t',turnId:'turn',itemId:'item',startedAtMs:Date.now(),command:'echo test',availableDecisions:['accept','decline']}});
+  assert.equal(sidebar.approvals.has('external'),true);sidebar.update({method:'serverRequest/resolved',params:{threadId:'t',requestId:'external'}});assert.equal(sidebar.approvals.has('external'),false);await command;
+  sidebar.update({method:'mode/changeRequested',params:{threadId:'t',turnId:'turn',requestId:'mode-1',targetMode:'plan',sourceToolCallId:null,reason:'需要先制定计划',allowedPrompts:[]}});
+  assert.equal(sidebar.approvals.has('mode:mode-1'),true);sidebar.resolveApproval('mode:mode-1','approve-mode');await new Promise(resolve=>setTimeout(resolve,0));assert.deepEqual(responses,[['t','mode-1','approved']]);
+  sidebar.update({method:'mode/changeRequested',params:{threadId:'t',turnId:'turn',requestId:'mode-2',targetMode:'default',sourceToolCallId:null,reason:'计划已完成',allowedPrompts:[{tool:'Bash',prompt:'npm test'}]}});
+  sidebar.update({method:'mode/changeResolved',params:{threadId:'t',turnId:'turn',requestId:'mode-2',targetMode:'default',decision:'approved'}});await new Promise(resolve=>setTimeout(resolve,0));assert.equal(sidebar.approvals.has('mode:mode-2'),false);assert.equal(responses.length,1);
  } finally {sidebar.dispose();}
 });
 await test('context compaction queue state does not lock the ordinary turn lifecycle',()=>{

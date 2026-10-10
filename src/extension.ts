@@ -23,6 +23,10 @@ import type { McpElicitationSchema } from './protocol/v2/McpElicitationSchema';
 import type { McpElicitationPrimitiveSchema } from './protocol/v2/McpElicitationPrimitiveSchema';
 import type { ModelFallbackEvent } from './protocol/v2/ModelFallbackEvent';
 import type { RequestPermissionProfile } from './protocol/v2/RequestPermissionProfile';
+import type { CommandExecutionApprovalDecision } from './protocol/v2/CommandExecutionApprovalDecision';
+import type { CommandExecutionRequestApprovalParams } from './protocol/v2/CommandExecutionRequestApprovalParams';
+import type { ModeChangeDecision } from './protocol/v2/ModeChangeDecision';
+import type { ModeChangeRequestedNotification } from './protocol/v2/ModeChangeRequestedNotification';
 
 type Message = { role: 'user' | 'assistant' | 'tool' | 'error'; text: string; id: string; turnId?: string; detail?: string; status?: string; process?: boolean; reasoningHasSummary?: boolean; processKind?: string; toolName?: string; paths?: string[]; changes?: { path: string; diff: string; currentPath?: string }[] };
 type ApprovalChoice = { id: string; label: string; description?: string; kind?: 'secondary' | 'danger'; response: unknown };
@@ -38,6 +42,7 @@ const MAX_TEXT_CHARACTERS = 200_000;
 const MAX_DETAIL_CHARACTERS = 200_000;
 const MAX_DIFF_CHARACTERS = 1_000_000;
 const MAX_VIRTUAL_DOCUMENTS = 40;
+const EXTERNALLY_RESOLVED = Symbol('externally-resolved');
 export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
   // Each live conversation owns an independent CLI process and task state.
   private readonly runtimeId = 'local-' + randomBytes(8).toString('hex');
@@ -302,6 +307,9 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
   }
   private update(event: ServerNotification) {
     if ('threadId' in event.params && this.threadId && event.params.threadId !== this.threadId) return;
+    if (event.method === 'serverRequest/resolved') { this.dismissApproval(String(event.params.requestId)); return; }
+    if (event.method === 'mode/changeRequested') { void this.requestModeChange(event.params); return; }
+    if (event.method === 'mode/changeResolved') { this.dismissApproval(`mode:${event.params.requestId}`); return; }
     if (event.method === 'thread/tokenUsage/updated') {
       this.threadId ??= event.params.threadId;
       this.usage.update(event.params.threadId, event.params.tokenUsage.total.totalTokens, this.restoredUsage);
@@ -441,15 +449,10 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
   private async request(request: ServerRequest): Promise<unknown> {
     if (request.method === 'item/commandExecution/requestApproval') {
       const params = request.params;
-      const detail = [params.command, params.cwd ? `工作目录：${params.cwd}` : '', params.reason ? `原因：${params.reason}` : '', params.networkApprovalContext ? `网络目标：${params.networkApprovalContext.protocol}://${params.networkApprovalContext.host}` : ''].filter(Boolean).join('\n');
-      const extras: ApprovalChoice[] = [];
-      if (params.proposedExecpolicyAmendment?.length) extras.push({id:'remember-command',label:'允许并记住此类命令',description:'保存 CLI 提议的命令规则，当前会话后续匹配操作不再询问。',kind:'secondary',response:{decision:{acceptWithExecpolicyAmendment:{execpolicy_amendment:params.proposedExecpolicyAmendment}}}});
-      for (const [index, amendment] of (params.proposedNetworkPolicyAmendments ?? []).entries()) {
-        const allow = amendment.action === 'allow';
-        extras.push({id:`network-policy-${index}`,label:`${allow ? '允许' : '拒绝'}并记住 ${amendment.host}`,description:`保存网络规则：${amendment.action} ${amendment.host}`,kind:allow?'secondary':'danger',response:{decision:{applyNetworkPolicyAmendment:{network_policy_amendment:amendment}}}});
-      }
-      const decline = {decision:'decline'};
-      return this.waitForApproval(request.id, '命令执行需要授权', detail || '允许执行该命令？', this.modernApprovalChoices(extras), decline);
+      const detail = [params.command, params.cwd ? `工作目录：${params.cwd}` : '', params.reason ? `原因：${params.reason}` : '', params.networkApprovalContext ? `网络目标：${params.networkApprovalContext.protocol}://${params.networkApprovalContext.host}` : '', params.additionalPermissions ? `额外权限：\n${JSON.stringify(params.additionalPermissions, null, 2)}` : ''].filter(Boolean).join('\n');
+      const choices = this.commandApprovalChoices(params);
+      const decline = choices.find(choice => choice.response && typeof choice.response === 'object' && 'decision' in choice.response && ['decline','cancel'].includes(String(choice.response.decision)))?.response ?? {decision:'decline'};
+      return this.waitForApproval(request.id, '命令执行需要授权', detail || '允许执行该命令？', choices, decline);
     }
     if (request.method === 'item/fileChange/requestApproval') {
       const detail = [request.params.reason, request.params.grantRoot ? `请求写入目录：${request.params.grantRoot}` : ''].filter(Boolean).join('\n') || '允许修改文件？';
@@ -476,11 +479,26 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
       const epoch = this.epoch;
       const answers: Record<string, { answers: string[] }> = {};
       for (const question of request.params.questions) {
-        let answer: string | undefined;
-        if (question.options?.length) { const options = question.options.map(option => ({ label: option.label, description: option.description })); const result = await vscode.window.showQuickPick([...options, { label: '输入其他回答', description: '' }], { title: question.question }); if (result?.label === '输入其他回答') answer = await vscode.window.showInputBox({ prompt: question.question, password: question.isSecret }); else answer = result?.label; }
-        else answer = await vscode.window.showInputBox({ prompt: question.question, password: question.isSecret });
+        let selectedAnswers: string[] = [];
+        if (question.options?.length) {
+          const otherLabel = '输入其他回答';
+          const options = question.options.map(option => ({ label: option.label, description: option.description, other:false }));
+          const choices = question.isOther ? [...options, {label:otherLabel,description:'',other:true}] : options;
+          if (question.multiSelect) {
+            const result = await vscode.window.showQuickPick(choices, {title:question.question,canPickMany:true});
+            selectedAnswers = result?.filter(option => !option.other).map(option => option.label) ?? [];
+            if (result?.some(option => option.other)) { const other = await vscode.window.showInputBox({prompt:question.question,password:question.isSecret}); if (other) selectedAnswers.push(other); }
+          } else {
+            const result = await vscode.window.showQuickPick(choices, {title:question.question});
+            if (result?.other) { const other = await vscode.window.showInputBox({prompt:question.question,password:question.isSecret}); if (other) selectedAnswers = [other]; }
+            else if (result) selectedAnswers = [result.label];
+          }
+        } else {
+          const answer = await vscode.window.showInputBox({ prompt: question.question, password: question.isSecret });
+          if (answer) selectedAnswers = [answer];
+        }
         if (epoch !== this.epoch) return { answers: {} };
-        answers[question.id] = { answers: answer ? [answer] : [] };
+        answers[question.id] = { answers: selectedAnswers };
       }
       return { answers };
     }
@@ -491,7 +509,30 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     }
     if (request.method === 'item/tool/call') throw this.serverRequestError(`未注册动态工具：${request.params.namespace ? `${request.params.namespace}/` : ''}${request.params.tool}`, -32601);
     if (request.method === 'attestation/generate') throw this.serverRequestError('当前 VS Code 扩展不提供设备证明能力。', -32601);
+    if (request.method === 'currentTime/read') return {currentTimeAt:Math.floor(Date.now()/1000)};
     throw this.serverRequestError(`尚不支持服务端请求：${(request as ServerRequest).method}`, -32601);
+  }
+  private commandApprovalChoices(params: CommandExecutionRequestApprovalParams): ApprovalChoice[] {
+    if (params.availableDecisions !== undefined && params.availableDecisions !== null) {
+      if (!params.availableDecisions.length) throw this.serverRequestError('CLI 未提供可用的命令授权决定。', -32602);
+      return params.availableDecisions.map((decision, index) => this.commandDecisionChoice(decision, index));
+    }
+    const extras: ApprovalChoice[] = [];
+    if (params.proposedExecpolicyAmendment?.length) extras.push({id:'remember-command',label:'允许并记住此类命令',description:'保存 CLI 提议的命令规则，当前会话后续匹配操作不再询问。',kind:'secondary',response:{decision:{acceptWithExecpolicyAmendment:{execpolicy_amendment:params.proposedExecpolicyAmendment}}}});
+    for (const [index, amendment] of (params.proposedNetworkPolicyAmendments ?? []).entries()) {
+      const allow = amendment.action === 'allow';
+      extras.push({id:`network-policy-${index}`,label:`${allow ? '允许' : '拒绝'}并记住 ${amendment.host}`,description:`保存网络规则：${amendment.action} ${amendment.host}`,kind:allow?'secondary':'danger',response:{decision:{applyNetworkPolicyAmendment:{network_policy_amendment:amendment}}}});
+    }
+    return this.modernApprovalChoices(extras);
+  }
+  private commandDecisionChoice(decision: CommandExecutionApprovalDecision, index: number): ApprovalChoice {
+    if (decision === 'accept') return {id:'accept',label:'允许一次',description:'只允许当前这次操作。',response:{decision}};
+    if (decision === 'acceptForSession') return {id:'accept-session',label:'本会话允许',description:'当前 CLI 会话内后续同类请求不再询问。',kind:'secondary',response:{decision}};
+    if (decision === 'decline') return {id:'decline',label:'拒绝并继续',description:'拒绝这次操作，让模型尝试其他办法。',kind:'secondary',response:{decision}};
+    if (decision === 'cancel') return {id:'cancel',label:'拒绝并停止',description:'拒绝这次操作并立即停止当前任务。',kind:'danger',response:{decision}};
+    if ('acceptWithExecpolicyAmendment' in decision) return {id:`remember-command-${index}`,label:'允许并记住此类命令',description:'保存 CLI 提供的命令规则。',kind:'secondary',response:{decision}};
+    const amendment = decision.applyNetworkPolicyAmendment.network_policy_amendment;
+    return {id:`network-policy-${index}`,label:`${amendment.action === 'allow' ? '允许' : '拒绝'}并记住 ${amendment.host}`,description:`保存网络规则：${amendment.action} ${amendment.host}`,kind:amendment.action === 'allow' ? 'secondary' : 'danger',response:{decision}};
   }
   private modernApprovalChoices(extras: ApprovalChoice[] = []): ApprovalChoice[] {
     return [
@@ -523,10 +564,29 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     const choice = pending.choices.find(option => option.id === choiceId); if (!choice) return false;
     pending.resolve(choice.response); this.approvals.delete(id); this.phase = this.approvals.size ? '等待授权' : '处理中'; this.sync(); return true;
   }
+  private dismissApproval(id: string) {
+    const pending = this.approvals.get(id); if (!pending) return false;
+    pending.resolve(EXTERNALLY_RESOLVED); this.approvals.delete(id);
+    this.phase = this.approvals.size ? '等待授权' : this.busy ? '处理中' : '就绪'; this.sync(); return true;
+  }
   private waitForApproval(idValue: string | number, title: string, detail: string, choices: ApprovalChoice[], decline: unknown) {
     return new Promise(resolve => {
       const id = String(idValue); this.phase = '等待授权'; this.approvals.set(id, { id, title, detail, choices, decline, resolve }); this.sync();
     });
+  }
+  private async requestModeChange(params: ModeChangeRequestedNotification) {
+    const epoch = this.epoch;
+    const target = params.targetMode === 'plan' ? '计划模式' : params.targetMode === 'default' ? '默认模式' : params.targetMode;
+    const prompts = params.allowedPrompts?.map(prompt => `${prompt.tool}：${prompt.prompt}`).join('\n');
+    const detail = [params.reason, prompts ? `将预先允许的操作：\n${prompts}` : ''].filter(Boolean).join('\n\n');
+    const result = await this.waitForApproval(`mode:${params.requestId}`, `模型请求切换到${target}`, detail || `允许切换到${target}？`, [
+      {id:'approve-mode',label:'允许切换',description:`切换到${target}继续任务。`,response:'approved'},
+      {id:'reject-mode',label:'拒绝切换',description:'保持当前模式，让模型继续尝试。',kind:'secondary',response:'rejected'},
+      {id:'cancel-mode',label:'取消请求',description:'取消这次模式切换请求。',kind:'danger',response:'cancelled'},
+    ], 'rejected');
+    if (result === EXTERNALLY_RESOLVED || epoch !== this.epoch) return;
+    try { await this.getAgent().respondModeChange(params.threadId, params.requestId, result as ModeChangeDecision); }
+    catch (error) { if (epoch === this.epoch) this.error(`回复模式切换失败：${String(error)}`); }
   }
   private serverRequestError(message: string, code: number) {
     const error = new Error(message) as Error & {code:number}; error.code = code; return error;
