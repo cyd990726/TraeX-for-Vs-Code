@@ -602,8 +602,11 @@ window.addEventListener('message', ({ data }) => {
       const card = element('div', 'approval'); card.append(element('strong', '', approval.title), element('pre', '', approval.detail));
       const actions = element('div', 'approval-actions');
       for (const choice of approval.choices ?? []) {
-        const button = element('button', choice.kind ? `approval-${choice.kind}` : '', choice.label); button.type = 'button'; button.title = choice.description ?? '';
-        button.onclick = () => { for (const button of card.querySelectorAll('button')) button.disabled = true; post({ type: 'permission', id: approval.id, choice: choice.id }); };
+        const button = element('button', `approval-option${choice.kind ? ` approval-${choice.kind}` : ''}`); button.type = 'button'; button.setAttribute('aria-label', choice.label);
+        const copy = element('span', 'approval-option-copy'); copy.append(element('span', 'approval-option-label', choice.label));
+        if (choice.description) copy.append(element('span', 'approval-option-description', choice.description));
+        button.append(element('span', 'approval-option-marker', '›'), copy);
+        button.onclick = () => { actions.dataset.submitting = 'true'; for (const button of card.querySelectorAll('button')) button.disabled = true; post({ type: 'permission', id: approval.id, choice: choice.id }); };
         actions.append(button);
       }
       card.append(actions);

@@ -114,8 +114,11 @@ try {
  await update({busy:false});assert.equal(await page.locator('.process-group[data-status=inProgress]').count(),0);
  await update({reset:true,busy:true,activeTurnId:'new-turn',phase:'模型处理中',messages:[{id:'old-user',role:'user',text:'旧任务'},{id:'old-tool',turnId:'old-turn',role:'tool',text:'旧工具',status:'inProgress'},{id:'old-reply',role:'assistant',text:'旧任务仍有迟到状态'},{id:'new-user',role:'user',text:'新任务'},{id:'new-tool',turnId:'new-turn',role:'tool',text:'新任务步骤',status:'completed'}]});
  assert.equal(await page.locator('.process-group').count(),2);assert.equal(await page.locator('.process-group').first().locator('.process-indicator').isVisible(),false);assert.equal(await page.locator('.process-group').last().locator('.process-indicator').isVisible(),true);
- assert.deepEqual(await page.locator('.approval-actions button').allTextContents(),['允许一次','本会话允许','拒绝并继续','拒绝并停止']);
- assert.equal(await page.getByRole('button',{name:'拒绝并停止'}).getAttribute('class'),'approval-danger');
+ assert.deepEqual(await page.locator('.approval-option-label').allTextContents(),['允许一次','本会话允许','拒绝并继续','拒绝并停止']);
+ assert.equal(await page.getByRole('button',{name:'拒绝并停止'}).evaluate(node=>node.classList.contains('approval-danger')),true);
+ assert.deepEqual(await page.locator('.approval-option-description').allTextContents(),['只允许这次操作','本会话不再询问']);
+ const approvalWidth=await page.locator('.approval-actions').boundingBox();const optionWidths=await page.locator('.approval-option').evaluateAll(nodes=>nodes.map(node=>node.getBoundingClientRect().width));
+ assert.ok(Math.max(...optionWidths)-Math.min(...optionWidths)<1);assert.ok(approvalWidth.width-Math.max(...optionWidths)<=3);
  await page.getByRole('button',{name:'本会话允许'}).click();
  assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='permission'&&message.choice==='accept-session')));
  assert.equal(await page.locator('.approval-actions button:disabled').count(),4);

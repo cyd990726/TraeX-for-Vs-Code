@@ -181,3 +181,20 @@ article.user.failed {border-color:color-mix(in srgb,var(--vscode-errorForeground
 .approval-actions .approval-secondary:hover {background:var(--vscode-button-secondaryHoverBackground);}
 .approval-actions .approval-danger {background:transparent;color:var(--vscode-errorForeground);border-color:currentColor;}
 .approval-actions .approval-danger:hover {background:var(--vscode-toolbar-hoverBackground);}
+
+/* Approval choices use full-width rows so labels and explanations remain readable in a narrow sidebar. */
+.approval-actions {display:flex;flex-direction:column;gap:0;margin-top:10px;border:1px solid var(--vscode-panel-border);border-radius:7px;overflow:hidden;}
+.approval-actions .approval-option {display:flex;align-items:flex-start;gap:9px;width:100%;min-height:46px;margin:0;padding:8px 10px;border:0;border-bottom:1px solid var(--vscode-panel-border);border-radius:0;text-align:left;background:transparent;color:var(--vscode-foreground);}
+.approval-actions .approval-option:last-child {border-bottom:0;}
+.approval-actions .approval-option:hover {background:var(--vscode-list-hoverBackground,var(--vscode-toolbar-hoverBackground));}
+.approval-actions .approval-option:focus-visible {position:relative;z-index:1;outline:1px solid var(--vscode-focusBorder);outline-offset:-2px;}
+.approval-option-marker {flex:0 0 auto;margin-top:1px;color:var(--vscode-descriptionForeground);font-size:15px;line-height:18px;}
+.approval-option-copy {display:flex;min-width:0;flex-direction:column;gap:1px;}
+.approval-option-label {font-size:12px;font-weight:500;line-height:18px;}
+.approval-option-description {color:var(--vscode-descriptionForeground);font-size:10px;line-height:15px;overflow-wrap:anywhere;}
+.approval-actions .approval-secondary {background:transparent;color:var(--vscode-foreground);}
+.approval-actions .approval-secondary:hover {background:var(--vscode-list-hoverBackground,var(--vscode-toolbar-hoverBackground));}
+.approval-actions .approval-danger {margin-top:4px;border-top:1px solid var(--vscode-panel-border);background:transparent;color:var(--vscode-errorForeground);}
+.approval-actions .approval-danger:hover {background:color-mix(in srgb,var(--vscode-errorForeground) 9%,transparent);}
+.approval-danger .approval-option-marker,.approval-danger .approval-option-description {color:var(--vscode-errorForeground);}
+.approval-actions[data-submitting=true] .approval-option {pointer-events:none;}
