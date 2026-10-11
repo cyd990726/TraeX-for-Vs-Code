@@ -178,6 +178,10 @@ try {
  assert.equal(await page.locator('#prompt').inputValue(),'不能被旧状态覆盖');
  await update({reset:true,messages:Array.from({length:350},(_,i)=>({id:'long-'+i,role:'assistant',text:'消息 '+i}))});
  assert.equal(await page.locator('article').count(),200);
+ const layout = await page.evaluate(() => { const body=document.body; const main=document.getElementById('messages'); const footer=document.querySelector('footer'); return {bodyScrollHeight:body.scrollHeight,bodyClientHeight:body.clientHeight,mainScrollHeight:main.scrollHeight,mainClientHeight:main.clientHeight,footerBottom:footer.getBoundingClientRect().bottom}; });
+ assert.equal(layout.bodyScrollHeight,layout.bodyClientHeight);
+ assert.equal(layout.footerBottom,await page.evaluate(()=>innerHeight));
+ assert.ok(layout.mainScrollHeight>layout.mainClientHeight);
  await page.getByRole('button',{name:'查看更早的消息'}).click();
  assert.equal(await page.locator('article').count(),200);
  assert.equal((await page.locator('article .content').first().textContent()).trim(),'消息 0');
