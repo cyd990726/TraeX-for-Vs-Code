@@ -1,4 +1,5 @@
 export const slashCommands = [
+  {name:'btw', description:'顺便提问：/btw 问题，不中断当前任务', input:true},
   {name:'model', description:'选择模型', picker:true},
   {name:'mode', description:'选择模型 Mode 和查看上下文窗口', picker:true},
   {name:'reasoning', description:'选择 Reasoning Level', picker:true},

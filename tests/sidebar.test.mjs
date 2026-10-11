@@ -28,6 +28,48 @@ await test('send snapshots draft and attachments before asynchronous preflight',
   assert.equal(submitted,'first\n\nA');assert.equal(sidebar.draft,'next draft');assert.deepEqual(sidebar.attachments.map(item=>item.id),['b']);assert.equal(sidebar.messages.filter(message=>message.role==='user').length,1);
  }finally{sidebar.dispose();}
 });
+await test('busy sends use the persistent queue and completion starts the next message',async()=>{
+ const sidebar=controller();const calls=[];let sequence=0;let queue=[];
+ sidebar.threadId='thread';sidebar.busy=true;sidebar.activeTurnId='active';sidebar.draft='next';sidebar.attachments=[{id:'skill',label:'技能',text:'使用技能',skill:{name:'demo',path:'/tmp/demo/SKILL.md'}}];
+ sidebar.agent={
+  addQueued:async(text,clientUserMessageId,skills)=>{calls.push(['add',text,skills]);const queuedSubmission={id:`q${++sequence}`,clientUserMessageId,input:[{type:'text',text,text_elements:[]},...skills.map(skill=>({type:'skill',...skill}))]};queue.push(queuedSubmission);return {queuedSubmission};},
+  listQueued:async()=>({data:queue,nextCursor:null}),
+  reorderQueued:async ids=>{const byId=new Map(queue.map(item=>[item.id,item]));queue=ids.map(id=>byId.get(id));},
+  deleteQueued:async id=>{const before=queue.length;queue=queue.filter(item=>item.id!==id);return {deleted:queue.length<before};},
+  startQueued:async id=>{calls.push(['start',id]);queue=queue.filter(item=>item.id!==id);return {turn:{id:'queued-turn',status:'inProgress'}};},dispose(){}
+ };
+ try{
+  await sidebar.send('next');assert.equal(calls[0][0],'add');assert.equal(calls[0][1],'next\n\n使用技能');assert.deepEqual(calls[0][2],[{name:'demo',path:'/tmp/demo/SKILL.md'}]);assert.equal(sidebar.draft,'');assert.equal(sidebar.queuedSubmissions.length,1);
+  sidebar.attachments=[];await sidebar.send('second');assert.equal(sidebar.queuedSubmissions.length,2);
+  await sidebar.editQueued('q1');assert.deepEqual(sidebar.queuedSubmissions.map(item=>item.id),['q2']);assert.equal(sidebar.draft,'next\n\n使用技能');assert.deepEqual(sidebar.attachments.map(item=>item.skill),[{name:'demo',path:'/tmp/demo/SKILL.md'}]);
+  sidebar.update({method:'turn/completed',params:{threadId:'thread',turn:{id:'active',status:'completed',error:null}}});await new Promise(resolve=>setTimeout(resolve,10));
+  assert.deepEqual(calls.find(call=>call[0]==='start'),['start','q2']);assert.equal(sidebar.busy,true);assert.equal(sidebar.activeTurnId,'queued-turn');assert.equal(sidebar.queuedSubmissions.length,0);
+ }finally{sidebar.dispose();}
+});
+await test('btw uses an independent request and streams without changing the main task',async()=>{
+ const sidebar=controller();const calls=[];const sent=[];sidebar.view={webview:{postMessage:message=>sent.push(message)}};sidebar.threadId='thread';sidebar.busy=true;sidebar.activeTurnId='main';sidebar.phase='执行命令';
+ sidebar.agent={btw:async(question,turnId)=>{calls.push([question,turnId]);return{turnId:'main'};},dispose(){}};
+ try {
+  await sidebar.executeSlash('btw','现在做到哪了？');assert.deepEqual(calls,[['现在做到哪了？','main']]);
+  const id=sidebar.btwRequest.messageId;
+  sidebar.update({method:'turn/btw/delta',params:{threadId:'thread',turnId:'main',delta:'正在'}});
+  assert.deepEqual(sent.at(-1),{type:'stream',viewKey:sidebar.runtimeId,id,delta:'正在'});
+  sidebar.update({method:'turn/btw/delta',params:{threadId:'thread',turnId:'main',delta:'检查代码'}});
+  assert.equal(sidebar.messages.find(item=>item.id===id).text,'正在检查代码');assert.equal(sidebar.busy,true);assert.equal(sidebar.activeTurnId,'main');assert.equal(sidebar.phase,'执行命令');assert.equal(sidebar.queuedSubmissions.length,0);
+  sidebar.update({method:'turn/btw/completed',params:{threadId:'thread',turnId:'main',answer:'检查完成'}});
+  assert.equal(sidebar.messages.find(item=>item.id===id).text,'检查完成');assert.equal(sidebar.messages.find(item=>item.id===id).status,'completed');assert.equal(sidebar.busy,true);assert.equal(sidebar.btwRequest,undefined);
+  await sidebar.executeSlash('btw','第二个问题');sidebar.update({method:'turn/btw/failed',params:{threadId:'thread',turnId:'main',message:'暂不可用'}});
+  assert.equal(sidebar.messages.at(-1).role,'error');assert.equal(sidebar.btwRequest,undefined);assert.equal(sidebar.busy,true);
+ } finally{sidebar.dispose();}
+});
+await test('btw rejects missing sessions and restores input when the RPC fails',async()=>{
+ const sidebar=controller();
+ try {
+  await sidebar.executeSlash('btw','问题');assert.equal(sidebar.draft,'/btw 问题');
+  sidebar.threadId='thread';sidebar.draft='';sidebar.agent={btw:async()=>{throw new Error('unsupported');},dispose(){}};
+  await sidebar.executeSlash('btw','重试问题');assert.equal(sidebar.draft,'/btw 重试问题');assert.equal(sidebar.btwRequest,undefined);assert.equal(sidebar.messages.at(-1).status,'failed');
+ } finally{sidebar.dispose();}
+});
 await test('unsent new-session drafts use a stable reload key',async()=>{
  const state=new Map();const first=controller(state);
  first.draft='survives reload';first.stashDraft();

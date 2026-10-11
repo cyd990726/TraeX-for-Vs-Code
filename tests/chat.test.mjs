@@ -5,10 +5,10 @@ const browser = await chromium.launch({ ...(process.env.CHROME_PATH ? { executab
 try {
  const page=await browser.newPage({viewport:{width:380,height:800}});
  const css=await readFile('dist/chat.css','utf8');
- await page.setContent(`<style>:root{--vscode-foreground:#ccc;--vscode-sideBar-background:#181818;--vscode-font-family:Arial;--vscode-font-size:13px;--vscode-descriptionForeground:#999;--vscode-panel-border:#333;--vscode-editorWidget-background:#252526;--vscode-input-background:#252526;--vscode-input-foreground:#ccc;--vscode-button-background:#0078d4;--vscode-button-foreground:#fff;--vscode-badge-background:#333;--vscode-badge-foreground:#ccc;--vscode-editor-font-family:monospace;--vscode-focusBorder:#0078d4;--vscode-textCodeBlock-background:#222;--vscode-button-secondaryBackground:#333;--vscode-button-secondaryForeground:#ccc;--vscode-errorForeground:#f88}${css}</style><header><div class="header-leading"><button id="back" aria-label="返回会话列表">←</button><span>TRAE</span></div><nav><button id="reconnect">重连</button><button id="review">变更</button><button id="history">历史</button><button id="new">新会话</button></nav></header><main id="messages"></main><section id="approvals"></section><footer><div id="connection"></div><div id="attachments"></div><form id="composer"><textarea id="prompt" rows="2"></textarea><div class="actions"><button id="attach" type="button">＋</button><button id="model" type="button">默认模型</button><span id="status"></span><button id="stop" type="button" hidden>■</button><button id="send">↑</button></div></form><div class="hint">project · Enter 发送</div></footer>`);
+ await page.setContent(`<style>:root{--vscode-foreground:#ccc;--vscode-sideBar-background:#181818;--vscode-font-family:Arial;--vscode-font-size:13px;--vscode-descriptionForeground:#999;--vscode-panel-border:#333;--vscode-editorWidget-background:#252526;--vscode-input-background:#252526;--vscode-input-foreground:#ccc;--vscode-button-background:#0078d4;--vscode-button-foreground:#fff;--vscode-badge-background:#333;--vscode-badge-foreground:#ccc;--vscode-editor-font-family:monospace;--vscode-focusBorder:#0078d4;--vscode-textCodeBlock-background:#222;--vscode-button-secondaryBackground:#333;--vscode-button-secondaryForeground:#ccc;--vscode-errorForeground:#f88}${css}</style><header><div class="header-leading"><button id="back" aria-label="返回会话列表">←</button><span>TRAE</span></div><nav><button id="reconnect">重连</button><button id="review">变更</button><button id="history">历史</button><button id="new">新会话</button></nav></header><main id="messages"></main><section id="message-queue"></section><section id="approvals"></section><footer><div id="connection"></div><div id="attachments"></div><form id="composer"><textarea id="prompt" rows="2"></textarea><div class="actions"><button id="attach" type="button">＋</button><button id="model" type="button">默认模型</button><span id="status"></span><button id="stop" type="button" hidden>■</button><button id="send">↑</button></div></form><div class="hint">project · Enter 发送</div></footer>`);
  await page.evaluate(()=>{window.sent=[];window.acquireVsCodeApi=()=>({postMessage:message=>window.sent.push(message)});});
  await page.addScriptTag({content:await readFile('dist/chat.js','utf8')});
- const state={type:'state',draft:'',busy:false,model:'默认模型',messages:[],attachments:[],approvals:[]};
+ const state={type:'state',draft:'',busy:false,queueReady:true,model:'默认模型',messages:[],attachments:[],queuedSubmissions:[],queueMutating:false,approvals:[]};
  const update=async change=>{Object.assign(state,change);await page.evaluate(data=>window.dispatchEvent(new MessageEvent('message',{data})),state);};
  await update({});assert.equal(await page.locator('.empty').count(),1);
  assert.equal(await page.locator('header #reconnect').count(),0);
@@ -25,6 +25,11 @@ try {
  assert.equal(await page.locator('#send').isEnabled(),false);
  await page.locator('#prompt').fill('/');assert.equal(await page.locator('#slash-menu').isVisible(),true);
  assert.ok(await page.locator('.slash-option').count()>8);
+ await page.locator('#prompt').fill('/btw');assert.match(await page.locator('.slash-option').first().textContent(),/^\/btw/);
+ await page.locator('#prompt').press('Enter');assert.equal(await page.locator('#prompt').inputValue(),'/btw ');
+ await page.locator('#prompt').fill('/btw 当前任务进展如何？');await page.locator('#prompt').press('Enter');
+ assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='slashExecute'&&message.command==='btw'&&message.option==='当前任务进展如何？')));
+ assert.equal(await page.locator('#prompt').inputValue(),'');
  await page.locator('#prompt').fill('/mode');assert.match(await page.locator('.slash-option').first().textContent(),/^\/mode/);
  await page.locator('#prompt').press('Enter');assert.equal(await page.locator('#prompt').inputValue(),'/mode ');
  const slashReply=async(command,options)=>{const request=await page.evaluate(command=>window.sent.filter(message=>message.type==='slashOptions'&&message.command===command).at(-1),command);await page.evaluate(data=>window.dispatchEvent(new MessageEvent('message',{data})),{type:'slashOptions',command,requestId:request.requestId,options});};
@@ -78,9 +83,16 @@ try {
 	 assert.match(await page.locator('#status').textContent(),/^模型负载 92% · 排队中 · 队列第 3 位 · 4[01]秒$/);
 	 await update({phase:'执行命令',startedAt:Date.now()-45000});
  assert.equal(await page.locator('#composer #status').count(),0);
- assert.equal(await page.locator('#send').isDisabled(),false);
- assert.equal(await page.locator('#send').getAttribute('aria-label'),'终止任务');
- assert.equal(await page.locator('#send').textContent(),'■');
+ assert.equal(await page.locator('#stop').isVisible(),true);
+ assert.equal(await page.locator('#send').getAttribute('aria-label'),'加入待执行队列');
+ assert.equal(await page.locator('#send').textContent(),'↑');
+ await page.locator('#prompt').fill('完成后继续检查测试');await page.locator('#prompt').press('Enter');assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='send'&&message.text==='完成后继续检查测试')));
+ await update({queuedSubmissions:[{id:'q1',text:'完成后继续检查测试',position:1},{id:'q2',text:'最后更新文档',position:2}]});
+ assert.deepEqual(await page.locator('.queue-text').allTextContents(),['完成后继续检查测试','最后更新文档']);
+ await page.locator('[data-queue-id=q2]').getByRole('button',{name:'上移待执行消息'}).click();assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='queueMove'&&message.id==='q2'&&message.direction===-1)));
+ await page.locator('[data-queue-id=q1]').getByRole('button',{name:'移出队列并在输入框编辑'}).click();assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='queueEdit'&&message.id==='q1')));assert.equal(await page.locator('[data-queue-id=q1] .queue-editor').count(),0);
+ await update({queuedSubmissions:[{id:'q2',text:'最后更新文档',position:1}],draft:'完成后继续检查测试',draftRevision:999,focusDraftRevision:999});assert.equal(await page.locator('#prompt').inputValue(),'完成后继续检查测试');assert.equal(await page.evaluate(()=>document.activeElement.id),'prompt');
+ await page.locator('[data-queue-id=q2]').getByRole('button',{name:'移除待执行消息'}).click();assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='queueDelete'&&message.id==='q2')));
  assert.equal(await page.locator('.process-label').textContent(),'调用工具 npm run build');
  assert.notEqual(await page.locator('.process-indicator').evaluate(node=>getComputedStyle(node).animationName),'none');
  assert.equal(await page.locator('.process-group').getAttribute('open'),null);
@@ -123,8 +135,8 @@ try {
  assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='permission'&&message.choice==='accept-session')));
  assert.equal(await page.locator('.approval-actions button:disabled').count(),4);
  await update({busy:true,phase:'模型处理中'});
- await page.locator('#send').click();assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='stop')));
- await update({busy:false,approvals:[]});
+ await page.locator('#stop').click();assert.ok(await page.evaluate(()=>window.sent.some(message=>message.type==='stop')));
+ await update({busy:false,queuedSubmissions:[],approvals:[]});
  await mkdir('docs',{recursive:true});await page.screenshot({path:'docs/chat-preview.png'});
  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth));
  const composerBox=await page.locator('#composer').boundingBox();
@@ -176,7 +188,7 @@ try {
  await page.waitForFunction(()=>document.querySelector('article pre code')?.textContent.includes('const n = 1;'));
  assert.equal(await page.locator('article strong').textContent(),'实时标题');
  assert.equal(await page.locator('article li').textContent(),'项目一');
- assert.equal(await page.locator('#send').getAttribute('aria-label'),'终止任务');
+ assert.equal(await page.locator('#send').getAttribute('aria-label'),'加入待执行队列');
  await page.evaluate(()=>{window.stableParagraph=document.querySelector('article p');window.stableCode=document.querySelector('article pre code');});
  const tail = 'console.log(n);\n```\n\n完成。';
  await page.evaluate(delta=>window.dispatchEvent(new MessageEvent('message',{data:{type:'stream',id:'md-live',delta}})),tail);
@@ -186,6 +198,12 @@ try {
  await update({busy:false,messages:[{id:'md-live',role:'assistant',text:partial+tail,status:'completed'}]});
  await page.waitForFunction(()=>!document.querySelector('article.streaming'));
  assert.ok(await page.evaluate(()=>window.stableParagraph===document.querySelector('article p')&&window.stableCode===document.querySelector('article pre code')));
+ const mathText = '行内公式 $E=mc^2$。\n\n$$\n\\frac{a}{b} = c\n$$\n\n```text\n$not-a-formula$\n```';
+ await update({reset:true,busy:false,messages:[{id:'math',role:'assistant',text:mathText,status:'completed'}]});
+ await page.waitForFunction(()=>document.querySelectorAll('article .katex').length===2);
+ assert.equal(await page.locator('article .katex').count(),2);
+ assert.equal(await page.locator('article .katex-display').count(),1);
+ assert.equal((await page.locator('article pre code').textContent()).trim(),'$not-a-formula$');
  await update({page:'sessions',busy:false,historyLoading:false,historyError:'',project:'当前项目',sessions:[{id:'one',title:'修复测试',preview:'检查构建',updatedAt:100,model:'test-model'}],hasMoreSessions:true});
  assert.equal(await page.locator('#composer').isVisible(),false);
  assert.equal(await page.locator('#messages').isVisible(),false);

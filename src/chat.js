@@ -7,7 +7,9 @@ const messages = document.getElementById('messages');
 const approvals = document.getElementById('approvals');
 let busy = false;
 let running = false;
+let transitioning = false;
 let lastDraft;
+let focusedDraftRevision;
 let revision = 0;
 let viewKey;
 let phase = '';
@@ -47,7 +49,7 @@ connectionPanel.replaceChildren(connectionLabel, reconnectButton);
 const usageHint = document.getElementById('token-usage') ?? document.querySelector('footer .hint');
 const usageValue = element('span', 'usage-value'); usageValue.setAttribute('aria-live', 'polite');
 usageHint.replaceChildren(usageValue);
-usageHint.title = 'CLI 返回的本会话累计 Token 用量，收到用量通知时实时更新；尚未返回时显示 —。Enter 发送，Shift+Enter 换行。';
+usageHint.title = 'CLI 返回的本会话累计 Token 用量，收到用量通知时实时更新；尚未返回时显示 —。Enter 发送，执行中 Enter 加入队列，Shift+Enter 换行。';
 let usageSnapshot;
 function formatTokens(tokens) {
   const units = ['', 'K', 'M', 'B', 'T', 'P'];
@@ -79,10 +81,10 @@ new ResizeObserver(([entry]) => {
     resizePrompt();
   }
 }).observe(prompt);
-function send() { if (submitSlash()) return; if (!busy && prompt.value.trim()) { const text = prompt.value; prompt.value = ''; lastDraft = ''; resizePrompt(); post({ type: 'send', text, revision: ++revision }); } }
+function send() { if (submitSlash()) return; if (!transitioning && prompt.value.trim()) { const text = prompt.value; prompt.value = ''; lastDraft = ''; resizePrompt(); post({ type: 'send', text, revision: ++revision }); } }
 document.getElementById('composer').addEventListener('submit', event => { event.preventDefault(); send(); });
 prompt.addEventListener('keydown', event => { if (handleSlashKey(event)) return; if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); send(); } });
-prompt.addEventListener('input', () => { lastDraft = prompt.value; post({ type: 'draft', text: prompt.value, revision: ++revision }); resizePrompt(); refreshSlash(); if (!running && !busy) document.getElementById('send').disabled = !prompt.value.trim(); });
+prompt.addEventListener('input', () => { lastDraft = prompt.value; post({ type: 'draft', text: prompt.value, revision: ++revision }); resizePrompt(); refreshSlash(); if (!transitioning) document.getElementById('send').disabled = !prompt.value.trim() || (running && !stateSnapshot?.queueReady) || !!stateSnapshot?.queueMutating; });
 for (const type of ['back', 'new', 'history', 'attach', 'review']) document.getElementById(type)?.addEventListener('click', () => post({ type }));
 if (!document.getElementById('back')) { const back = element('button', '', '←'); back.id = 'back'; back.setAttribute('aria-label', '返回会话列表'); document.querySelector('header').prepend(back); back.onclick = () => post({type:'back'}); }
 const sessionHome = document.getElementById('session-home') ?? element('section', 'session-home');
@@ -154,6 +156,32 @@ function showSessions(data) {
   }
   if (data.hasMoreSessions) { const more = element('button', 'session-more', data.historyLoading ? '加载中…' : '加载更多'); more.disabled = !!data.historyLoading; more.onclick = () => post({ type: 'moreSessions' }); sessionHome.append(more); }
 }
+const queuePanel = document.getElementById('message-queue');
+let queueSignature = '';
+function showQueue(data) {
+  const entries = data.queuedSubmissions ?? [];
+  const signature = JSON.stringify([entries, data.queueMutating, data.busy]);
+  if (signature === queueSignature) return;
+  queueSignature = signature; queuePanel.replaceChildren(); queuePanel.hidden = !entries.length;
+  if (!entries.length) return;
+  const heading = element('div', 'queue-heading');
+  const copy = element('div', 'queue-heading-copy'); copy.append(element('strong', '', `待执行 · ${entries.length}`), element('span', '', data.busy ? '当前任务结束后自动执行' : '等待启动'));
+  heading.append(copy);
+  if (!data.busy) { const start = element('button', 'queue-start', '开始'); start.type = 'button'; start.disabled = !!data.queueMutating; start.onclick = () => post({type:'queueStart'}); heading.append(start); }
+  queuePanel.append(heading);
+  for (const entry of entries) {
+    const row = element('div', 'queue-item'); row.dataset.queueId = entry.id;
+    const meta = element('div', 'queue-meta', `第 ${entry.position} 条`);
+    const body = element('pre', 'queue-text', entry.text);
+    const controls = element('div', 'queue-actions');
+    const action = (label, title, handler, disabled = false) => { const button=element('button','',label);button.type='button';button.title=title;button.setAttribute('aria-label',title);button.disabled=disabled||!!data.queueMutating;button.onclick=handler;controls.append(button);return button; };
+    action('↑', '上移待执行消息', ()=>post({type:'queueMove',id:entry.id,direction:-1}), entry.position===1);
+    action('↓', '下移待执行消息', ()=>post({type:'queueMove',id:entry.id,direction:1}), entry.position===entries.length);
+    action('编辑','移出队列并在输入框编辑',()=>post({type:'queueEdit',id:entry.id}));
+    action('移除','移除待执行消息',()=>post({type:'queueDelete',id:entry.id}));
+    row.append(meta,body,controls);queuePanel.append(row);
+  }
+}
 const jumpLatest = element('button', 'jump-latest', '↓ 回到最新'); jumpLatest.hidden = true; jumpLatest.type = 'button'; document.querySelector('footer').prepend(jumpLatest);
 function updateJump() { jumpLatest.hidden = windowEnd === null && messages.scrollHeight - messages.scrollTop - messages.clientHeight < 70; }
 messages.addEventListener('scroll', updateJump, {passive:true});
@@ -163,11 +191,9 @@ jumpLatest.onclick = () => {
 };
 const actions = document.querySelector('.actions');
 const sendButton = document.getElementById('send');
+const stopButton = document.getElementById('stop');
 actions.append(sendButton);
-document.getElementById('stop')?.remove();
-sendButton.addEventListener('click', event => {
-  if (running) { event.preventDefault(); sendButton.disabled = true; sendButton.title = '正在终止'; post({ type: 'stop' }); }
-});
+stopButton.onclick = () => { stopButton.disabled = true; stopButton.title = '正在终止'; post({ type: 'stop' }); };
 const modelButton = document.getElementById('model');
 const modelAnchor = element('div', 'model-anchor');
 modelButton.before(modelAnchor); modelAnchor.append(modelButton);
@@ -288,7 +314,7 @@ function renderSlash(query='') {
   if(!slashMenu.hidden && slashRenderKey===renderKey)return;
   slashRenderKey=renderKey;
   const needle=query.toLowerCase();
-  slashRows=(slashStage ? slashOptions : slashCommands.map(command=>({id:command.name,label:'/'+command.name,description:command.description,picker:command.picker}))).filter(option=>[option.label,option.id,option.description].some(value=>String(value??'').toLowerCase().includes(needle))).sort((a,b)=>Number(b.id.toLowerCase()===needle)-Number(a.id.toLowerCase()===needle));
+  slashRows=(slashStage ? slashOptions : slashCommands.map(command=>({id:command.name,label:'/'+command.name,description:command.description,picker:command.picker,input:command.input}))).filter(option=>[option.label,option.id,option.description].some(value=>String(value??'').toLowerCase().includes(needle))).sort((a,b)=>Number(b.id.toLowerCase()===needle)-Number(a.id.toLowerCase()===needle));
   slashMenu.replaceChildren(element('div','slash-heading',slashStage ? '/'+slashStage+' · 选择选项' : '命令'));
   if(slashStage) {const back=element('button','slash-back','← 命令列表');back.type='button';back.onclick=()=>{prompt.value='/';commitSlashDraft();slashStage='';slashDismissed=undefined;refreshSlash();prompt.focus();};slashMenu.firstChild.append(back);}
   slashRows.forEach((option,index)=>{
@@ -315,6 +341,11 @@ function refreshSlash() {
 function commitSlashDraft() {lastDraft=prompt.value;post({type:'draft',text:prompt.value,revision:++revision});resizePrompt();}
 function chooseSlash(index) {
   const option=slashRows[index];if(!option || slashOptionDisabled(option))return;
+  if(!slashStage && option.input) {
+    const match=prompt.value.match(/^\/btw\s+([\s\S]*)$/);const question=match?.[1].trim();
+    if(!question) {prompt.value='/btw ';commitSlashDraft();slashDismissed=undefined;refreshSlash();prompt.focus();return;}
+    prompt.value='';commitSlashDraft();closeSlash();post({type:'slashExecute',command:option.id,option:question});prompt.focus();return;
+  }
   if(!slashStage && option.picker) {prompt.value='/'+option.id+' ';commitSlashDraft();slashDismissed=undefined;refreshSlash();prompt.focus();return;}
   const command=slashStage || option.id;const selected=slashStage ? option.id : undefined;
   prompt.value='';commitSlashDraft();closeSlash();slashStage='';post({type:'slashExecute',command,option:selected});prompt.focus();
@@ -429,8 +460,10 @@ window.addEventListener('message', ({ data }) => {
   if (data.viewKey && data.viewKey !== viewKey) { viewKey = data.viewKey; revision = data.draftRevision ?? 0; lastDraft = undefined; closeModels(); closeSlash(); slashStage=''; slashRequest++; }
   showAuth(data);
   showSessions(data);
+  showQueue(data);
   if (data.page === 'sessions' || data.authRequired) {closeModels();closeSlash();}
   running = !!data.busy;
+  transitioning = !!data.transition;
   busy = data.busy || data.transition; phase = data.phase ?? '处理中'; startedAt = data.startedAt; refreshStatus();
   if (data.reset) { streams.clear(); store.clear(); windowEnd = null; }
   if (data.reset === undefined && data.messages) store.clear();
@@ -457,11 +490,15 @@ window.addEventListener('message', ({ data }) => {
   reconnectButton.textContent = data.transition && needsReconnect ? '重新连接中…' : '重新连接';
   connectionLabel.textContent = needsReconnect && ['已连接', '尚未连接'].includes(data.connection) ? '连接状态待确认' : data.connection ?? '';
   connectionPanel.hidden = !needsReconnect && (!data.connection || ['已连接', '尚未连接'].includes(data.connection));
-  sendButton.textContent = running ? '■' : '↑';
-  sendButton.type = running ? 'button' : 'submit';
-  sendButton.title = running ? '终止任务' : '发送';
+  actions.dataset.running = String(running);
+  stopButton.hidden = !running;
+  stopButton.disabled = !!data.transition || data.phase === '正在停止';
+  stopButton.title = data.phase === '正在停止' ? '正在终止' : '终止当前任务';
+  sendButton.textContent = '↑';
+  sendButton.type = 'submit';
+  sendButton.title = running ? data.queueReady ? '加入待执行队列' : '会话启动中' : '发送';
   sendButton.setAttribute('aria-label', sendButton.title);
-  sendButton.disabled = !!data.transition || data.phase === '正在停止' || (!running && !prompt.value.trim());
+  sendButton.disabled = !!data.transition || !!data.queueMutating || (running && !data.queueReady) || !prompt.value.trim();
   document.getElementById('new').disabled = !!data.transition;
   document.getElementById('back').disabled = !!data.transition;
   document.getElementById('history').disabled = !!data.transition;
@@ -501,8 +538,9 @@ window.addEventListener('message', ({ data }) => {
   reasoningButton.disabled = !!data.transition || data.reasoningSupported === false;
   reasoningButton.title = data.reasoningSupported === false ? '当前模型不支持调节 Reasoning Level' : 'Reasoning Level：' + (effortLabels[data.reasoning] ?? '模型默认') + '，下一次请求生效';
   if ((data.draftRevision ?? revision) >= revision && data.draft !== lastDraft) { prompt.value = data.draft; lastDraft = data.draft; resizePrompt(); }
+  if (data.focusDraftRevision && data.focusDraftRevision !== focusedDraftRevision) { focusedDraftRevision = data.focusDraftRevision; prompt.focus(); prompt.setSelectionRange(prompt.value.length,prompt.value.length); }
   if (document.activeElement===prompt && prompt.value.startsWith('/') && data.page!=='sessions') refreshSlash();
-  if (!running && !data.transition) sendButton.disabled = !prompt.value.trim();
+  if (!data.transition && !data.queueMutating) sendButton.disabled = !prompt.value.trim() || (running && !data.queueReady);
   const bottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 70;
   const ids = new Set(visible.map(message => message.id));
   for (const [id, node] of nodes) if (!ids.has(id)) { streams.delete(id); node.remove(); nodes.delete(id); }

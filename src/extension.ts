@@ -27,6 +27,8 @@ import type { CommandExecutionApprovalDecision } from './protocol/v2/CommandExec
 import type { CommandExecutionRequestApprovalParams } from './protocol/v2/CommandExecutionRequestApprovalParams';
 import type { ModeChangeDecision } from './protocol/v2/ModeChangeDecision';
 import type { ModeChangeRequestedNotification } from './protocol/v2/ModeChangeRequestedNotification';
+import type { QueuedSubmission } from './protocol/v2/QueuedSubmission';
+import type { UserInput } from './protocol/v2/UserInput';
 
 type Message = { role: 'user' | 'assistant' | 'tool' | 'error'; text: string; id: string; turnId?: string; detail?: string; status?: string; process?: boolean; reasoningHasSummary?: boolean; processKind?: string; toolName?: string; paths?: string[]; changes?: { path: string; diff: string; currentPath?: string }[] };
 type ApprovalChoice = { id: string; label: string; description?: string; kind?: 'secondary' | 'danger'; response: unknown };
@@ -78,10 +80,14 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
   private modelLoad?: ModelLoad;
   private queueStatus?: QueueStatus;
   private queueLoadTurnId?: string;
+  private queuedSubmissions: QueuedSubmission[] = [];
+  private queueMutating = false;
+  private queueStarting = false;
   private selectedReasoning?: ReasoningEffort;
   private reasoningOptions?: ReasoningEffortOption[];
   private permissionMode: PermissionMode = 'default';
   private slashSkills: {name:string;description:string;path:string;enabled:boolean}[] = [];
+  private btwRequest?: {messageId:string;turnId?:string};
   private selectedMode?: string;
   private modeOptions?: ModelMode[];
   private transition = false;
@@ -89,6 +95,7 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
   private connection = '尚未连接';
   private reconnectNeeded = false;
   private draftRevision = 0;
+  private focusDraftRevision?: number;
   private syncTimer?: NodeJS.Timeout;
   private draftTimer?: NodeJS.Timeout;
   private fullSync = true;
@@ -116,7 +123,7 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     view.webview.options = { enableScripts: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'dist')] };
     const uri = (name: string) => view.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'dist', name));
     const nonce = randomBytes(18).toString('hex');
-    view.webview.html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${view.webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${uri('chat.css')}"></head><body data-page="sessions"><header><div class="header-leading"><button id="back" title="返回会话列表" aria-label="返回会话列表">←</button><span>TRAE</span></div><nav><button id="review" title="审阅文件变更">变更</button><button id="history" title="历史会话">历史</button><button id="new" title="新建会话">新会话</button></nav></header><section id="session-home" aria-label="当前项目会话"></section><main id="messages" aria-live="polite"></main><section id="approvals" aria-label="权限确认"></section><footer><div id="connection" role="status"></div><div id="attachments"></div><div id="status" class="task-status" role="status"></div><form id="composer"><textarea id="prompt" rows="2" placeholder="向 TRAE 提问，或描述要完成的任务" aria-label="消息"></textarea><div class="actions"><button id="attach" type="button" title="添加文件或选中代码">＋</button><button id="model" type="button" title="选择模型">默认模型⌄</button><button id="send" type="submit" title="发送" aria-label="发送">↑</button></div></form><div class="hint" id="token-usage"></div></footer><script nonce="${nonce}" src="${uri('chat.js')}"></script></body></html>`;
+    view.webview.html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${view.webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${uri('chat.css')}"></head><body data-page="sessions"><header><div class="header-leading"><button id="back" title="返回会话列表" aria-label="返回会话列表">←</button><span>TRAE</span></div><nav><button id="review" title="审阅文件变更">变更</button><button id="history" title="历史会话">历史</button><button id="new" title="新建会话">新会话</button></nav></header><section id="session-home" aria-label="当前项目会话"></section><main id="messages" aria-live="polite"></main><section id="message-queue" aria-label="待执行消息"></section><section id="approvals" aria-label="权限确认"></section><footer><div id="connection" role="status"></div><div id="attachments"></div><div id="status" class="task-status" role="status"></div><form id="composer"><textarea id="prompt" rows="2" placeholder="向 TRAE 提问，或描述要完成的任务" aria-label="消息"></textarea><div class="actions"><button id="attach" type="button" title="添加文件或选中代码">＋</button><button id="model" type="button" title="选择模型">默认模型⌄</button><button id="stop" type="button" title="终止当前任务" aria-label="终止当前任务" hidden>■</button><button id="send" type="submit" title="发送" aria-label="发送">↑</button></div></form><div class="hint" id="token-usage"></div></footer><script nonce="${nonce}" src="${uri('chat.js')}"></script></body></html>`;
     const listener = view.webview.onDidReceiveMessage(message => {
       if (!message || typeof message !== 'object') return;
       const target = this.current;
@@ -132,6 +139,10 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
       if (message.type === 'copy' && typeof message.text === 'string') void vscode.env.clipboard.writeText(message.text);
       if (message.type === 'new') void this.restart();
       if (message.type === 'stop') void target.cancel();
+      if (message.type === 'queueEdit' && typeof message.id === 'string') void target.editQueued(message.id);
+      if (message.type === 'queueDelete' && typeof message.id === 'string') void target.deleteQueued(message.id);
+      if (message.type === 'queueMove' && typeof message.id === 'string' && (message.direction === -1 || message.direction === 1)) void target.moveQueued(message.id, message.direction);
+      if (message.type === 'queueStart' && (message.id === undefined || typeof message.id === 'string')) void target.startNextQueued(message.id);
       if (message.type === 'history' || message.type === 'back') void this.history();
       if (message.type === 'refreshSessions') void this.loadSessions();
       if (message.type === 'moreSessions') void this.loadSessions(true);
@@ -178,7 +189,7 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
       this.fingerprints.set(message.id, signature); return reset || previous !== signature;
     });
     this.fullSync = false;
-    void this.view.webview.postMessage({ type: 'state', viewKey: target.runtimeId, authRequired: this.authRequired || target.authRequired, loginPending: this.loginPending, loginError: this.loginError, page: this.page, project: vscode.workspace.workspaceFolders?.[0]?.name ?? '未打开项目', sessions: sessionRows, conversationTitle: sessionRows.find(session => session.id === (target.threadId ?? target.runtimeId))?.title ?? '新会话', historyLoading: this.historyLoading, historyError: this.historyError, hasMoreSessions: !!this.historyCursor, currentSession: target.threadId, activeTurnId: target.activeTurnId, reset, messages: changed, removed, busy: target.busy, transition: target.transition, connection: target.connection, reconnectNeeded: target.reconnectNeeded, phase: target.phase, startedAt: target.turnStartedAt, draftRevision: target.draftRevision, draft: target.draft, model: target.selectedModel?.displayName ?? '默认模型', tokenUsage: { session: this.usage.summary(target.threadId).session }, permissionMode: target.permissionMode, modelMode: target.selectedMode, modeLabel: target.modeOptions?.find(option => option.id === target.selectedMode)?.name, modeSupported: target.modeOptions ? target.modeOptions.length > 0 : undefined, reasoning: target.selectedReasoning, reasoningSupported: target.reasoningOptions ? target.reasoningOptions.length > 0 : undefined, attachments: target.attachments.map(({ id, label, text }) => ({ id, label, size: text.length })), approvals: [...target.approvals.values()].map(({ id, title, detail, choices }) => ({ id, title, detail, choices: choices.map(({id,label,description,kind}) => ({id,label,description,kind})) })) });
+    void this.view.webview.postMessage({ type: 'state', viewKey: target.runtimeId, authRequired: this.authRequired || target.authRequired, loginPending: this.loginPending, loginError: this.loginError, page: this.page, project: vscode.workspace.workspaceFolders?.[0]?.name ?? '未打开项目', sessions: sessionRows, conversationTitle: sessionRows.find(session => session.id === (target.threadId ?? target.runtimeId))?.title ?? '新会话', historyLoading: this.historyLoading, historyError: this.historyError, hasMoreSessions: !!this.historyCursor, currentSession: target.threadId, activeTurnId: target.activeTurnId, reset, messages: changed, removed, busy: target.busy, queueReady: !!target.threadId, transition: target.transition, connection: target.connection, reconnectNeeded: target.reconnectNeeded, phase: target.phase, startedAt: target.turnStartedAt, draftRevision: target.draftRevision, focusDraftRevision: target.focusDraftRevision, draft: target.draft, model: target.selectedModel?.displayName ?? '默认模型', tokenUsage: { session: this.usage.summary(target.threadId).session }, permissionMode: target.permissionMode, modelMode: target.selectedMode, modeLabel: target.modeOptions?.find(option => option.id === target.selectedMode)?.name, modeSupported: target.modeOptions ? target.modeOptions.length > 0 : undefined, reasoning: target.selectedReasoning, reasoningSupported: target.reasoningOptions ? target.reasoningOptions.length > 0 : undefined, attachments: target.attachments.map(({ id, label, text }) => ({ id, label, size: text.length })), queuedSubmissions: target.queuedSubmissions.map((item,index)=>({id:item.id,text:target.queuedText(item),position:index+1})), queueMutating: target.queueMutating || target.queueStarting, approvals: [...target.approvals.values()].map(({ id, title, detail, choices }) => ({ id, title, detail, choices: choices.map(({id,label,description,kind}) => ({id,label,description,kind})) })) });
   }
   private cliOptions() {
     const folder = vscode.workspace.workspaceFolders?.[0];
@@ -307,6 +318,26 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
   }
   private update(event: ServerNotification) {
     if ('threadId' in event.params && this.threadId && event.params.threadId !== this.threadId) return;
+    if (event.method === 'turn/btw/delta' || event.method === 'turn/btw/completed' || event.method === 'turn/btw/failed') {
+      const request=this.btwRequest;if(!request || (request.turnId && request.turnId!==event.params.turnId))return;
+      request.turnId=event.params.turnId;
+      const message=this.messages.find(item=>item.id===request.messageId);if(!message)return;
+      if(event.method==='turn/btw/delta') {
+        const combined=message.text+event.params.delta;message.text=this.limitText(combined,MAX_TEXT_CHARACTERS);
+        const host=this.owner??this;
+        if(message.text===combined && host.current===this && host.view && !host.fullSync && host.fingerprints.has(message.id)) {
+          void host.view.webview.postMessage({type:'stream',viewKey:this.runtimeId,id:message.id,delta:event.params.delta});return;
+        }
+      }
+      else {
+        message.text=this.limitText(event.method==='turn/btw/completed'?event.params.answer:event.params.message,MAX_TEXT_CHARACTERS);
+        message.status=event.method==='turn/btw/completed'?'completed':'failed';
+        if(event.method==='turn/btw/failed')message.role='error';
+        this.btwRequest=undefined;
+      }
+      this.sync(true);return;
+    }
+    if (event.method === 'thread/queue/changed') { void this.refreshQueued(); }
     if (event.method === 'serverRequest/resolved') { this.dismissApproval(String(event.params.requestId)); return; }
     if (event.method === 'mode/changeRequested') { void this.requestModeChange(event.params); return; }
     if (event.method === 'mode/changeResolved') { this.dismissApproval(`mode:${event.params.requestId}`); return; }
@@ -409,6 +440,7 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
       for (const message of this.messages) if ((message.turnId===event.params.turn.id || (!message.turnId && completingActive)) && message.status === 'streaming') message.status = 'completed';
       if (event.params.turn.error) this.error(event.params.turn.error.message);
       if (event.params.turn.status === 'interrupted') this.pushMessage({ id: randomBytes(8).toString('hex'), turnId:event.params.turn.id, role: 'tool', process:false, text: '已停止' });
+      if (completingActive) void this.startNextQueued();
       (this.owner ?? this).pruneLiveSessions();
     }
     if (event.method === 'error') this.error(event.params.error.message);
@@ -660,8 +692,82 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     }
     this.pushMessage({ role: 'error', text, id: randomBytes(8).toString('hex') }); this.sync();
   }
+  private queuedText(item: QueuedSubmission) { return item.input.filter((input): input is Extract<UserInput,{type:'text'}>=>input.type==='text').map(input=>input.text).join('\n'); }
+  private async refreshQueued() {
+    const epoch=this.epoch; if(!this.threadId)return;
+    try {
+      const result=await this.getAgent().listQueued();
+      if(epoch!==this.epoch)return;
+      this.queuedSubmissions=result.data;this.sync();
+    } catch(error) { if(epoch===this.epoch)this.output.appendLine(`读取消息队列失败：${String(error)}`); }
+  }
+  private async enqueue(text: string) {
+    if(this.queueMutating || !this.threadId || !text.trim())return;
+    const submittedAttachments=[...this.attachments];
+    const input=[text.trim(),...submittedAttachments.map(item=>item.text)].join('\n\n');
+    const limit=vscode.workspace.getConfiguration('traecli').get<number>('maxContextCharacters',200000);
+    if(input.length>limit){this.error(`消息和附件共 ${input.length} 字符，超过 ${limit} 字符限制，请移除附件或缩小选区。`);return;}
+    const snapshot={text,attachments:submittedAttachments};
+    this.draft='';this.attachments=[];this.queueMutating=true;this.stashDraft();this.sync();
+    try {
+      const skills=submittedAttachments.flatMap(attachment=>attachment.skill?[attachment.skill]:[]);
+      const result=await this.getAgent().addQueued(input,randomBytes(8).toString('hex'),skills);
+      const index=this.queuedSubmissions.findIndex(item=>item.id===result.queuedSubmission.id);
+      if(index>=0)this.queuedSubmissions[index]=result.queuedSubmission;else this.queuedSubmissions.push(result.queuedSubmission);
+      this.lastActivityAt=Date.now();
+    } catch(error) {
+      this.draft=this.draft?`${snapshot.text}\n\n${this.draft}`:snapshot.text;
+      const existing=new Set(this.attachments.map(item=>item.id));
+      this.attachments=[...snapshot.attachments.filter(item=>!existing.has(item.id)),...this.attachments];
+      this.stashDraft();this.error(`加入待执行队列失败：${String(error)}\n输入和附件已恢复。`);
+    } finally {this.queueMutating=false;this.sync();}
+  }
+  private async editQueued(id: string) {
+    if(this.queueMutating)return;
+    const item=this.queuedSubmissions.find(entry=>entry.id===id);if(!item)return;
+    this.queueMutating=true;this.sync();
+    try {
+      const result=await this.getAgent().deleteQueued(id);if(!result.deleted)throw new Error('服务端未移除该待执行消息');
+      this.queuedSubmissions=this.queuedSubmissions.filter(entry=>entry.id!==id);
+      const text=this.queuedText(item);
+      this.draft=this.draft?`${text}\n\n${this.draft}`:text;
+      const skillAttachments=item.input.filter((input):input is Extract<UserInput,{type:'skill'}>=>input.type==='skill').map(skill=>({id:randomBytes(8).toString('hex'),label:`技能 · ${skill.name}`,text:'',skill:{name:skill.name,path:skill.path}}));
+      const existing=new Set(this.attachments.map(attachment=>attachment.skill?.path));
+      this.attachments=[...skillAttachments.filter(attachment=>!existing.has(attachment.skill?.path)),...this.attachments];
+      this.focusDraftRevision=++this.draftRevision;this.stashDraft();
+    } catch(error) {this.error(`编辑待执行消息失败：${String(error)}`);}
+    finally {this.queueMutating=false;this.sync();}
+  }
+  private async deleteQueued(id: string) {
+    if(this.queueMutating)return;const item=this.queuedSubmissions.find(entry=>entry.id===id);if(!item)return;
+    this.queueMutating=true;this.sync();
+    try {const result=await this.getAgent().deleteQueued(id);if(result.deleted)this.queuedSubmissions=this.queuedSubmissions.filter(entry=>entry.id!==id);}
+    catch(error){this.error(`移除待执行消息失败：${String(error)}`);}
+    finally{this.queueMutating=false;this.sync();}
+  }
+  private async moveQueued(id: string,direction: -1|1) {
+    if(this.queueMutating)return;const index=this.queuedSubmissions.findIndex(entry=>entry.id===id);const target=index+direction;if(index<0||target<0||target>=this.queuedSubmissions.length)return;
+    const reordered=[...this.queuedSubmissions];[reordered[index],reordered[target]]=[reordered[target],reordered[index]];
+    this.queueMutating=true;this.sync();
+    try {await this.getAgent().reorderQueued(reordered.map(entry=>entry.id));this.queuedSubmissions=reordered;}
+    catch(error){this.error(`调整待执行顺序失败：${String(error)}`);}
+    finally{this.queueMutating=false;this.sync();}
+  }
+  private async startNextQueued(id?: string) {
+    if(this.busy||this.transition||this.queueStarting||!this.threadId)return;
+    this.queueStarting=true;this.sync();
+    try {
+      const result=await this.getAgent().listQueued();this.queuedSubmissions=result.data;
+      const next=id?this.queuedSubmissions.find(item=>item.id===id):this.queuedSubmissions[0];if(!next)return;
+      const startedAt=Date.now();this.busy=true;this.phase='启动待执行任务';this.turnStartedAt=startedAt;this.lastActivityAt=startedAt;this.stopRequested=false;this.sync();
+      const started=await this.getAgent().startQueued(next.id);
+      this.activeTurnId=started.turn.id;this.queuedSubmissions=this.queuedSubmissions.filter(item=>item.id!==next.id);
+    } catch(error) {const uncertain=error instanceof Error&&error.name==='TurnStartUncertain';this.busy=uncertain;if(!uncertain)this.activeTurnId=undefined;if(!uncertain)this.turnStartedAt=undefined;this.phase=uncertain?'状态待确认，请重连':'队列启动失败';this.error(`启动待执行任务失败：${String(error)}${uncertain?'\n请先重连确认任务状态，不要重复启动。':''}`);}
+    finally{this.queueStarting=false;this.sync();}
+  }
   private async send(text: string) {
-    if (this.page !== 'chat' || this.busy || this.transition || !text.trim()) return;
+    if (this.page !== 'chat' || this.transition || !text.trim()) return;
+    if (this.busy) {if(!this.threadId){this.draft=text;this.sync();return;}await this.enqueue(text);return;}
     const epoch = this.epoch;
     if (this.authRequired || this.owner?.authRequired) { this.sync(); return; }
     const creating = !this.threadId;
@@ -742,7 +848,8 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
   }
   private releaseRootConversation() {
     ++this.epoch; this.clearApprovals(); this.agent?.dispose(); this.agent = undefined;
-    this.messages = []; this.threadId = undefined; this.activeTurnId = undefined; this.completedTurnIds.clear(); this.inFlight = undefined;
+    this.messages = []; this.threadId = undefined; this.activeTurnId = undefined; this.completedTurnIds.clear(); this.inFlight = undefined; this.btwRequest = undefined;
+    this.queuedSubmissions = []; this.queueMutating = false; this.queueStarting = false;
     this.busy = false; this.compacting = false; this.transition = false; this.turnStartedAt = undefined;
     this.queueStatus = undefined; this.queueLoadTurnId = undefined; this.connection = '尚未连接'; this.phase = '就绪';
   }
@@ -750,7 +857,7 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     const host = this.owner ?? this;
     while (host.liveSessions.size > MAX_LIVE_SESSIONS) {
       const candidate = [...host.liveSessions]
-        .filter(session => session !== host.current && !session.busy && !session.transition && !session.inFlight && !session.approvals.size && !session.draft && !session.attachments.length)
+        .filter(session => session !== host.current && !session.busy && !session.transition && !session.inFlight && !session.btwRequest && !session.queueMutating && !session.queueStarting && !session.queuedSubmissions.length && !session.approvals.size && !session.draft && !session.attachments.length)
         .sort((a,b)=>(a.lastActivityAt ?? 0)-(b.lastActivityAt ?? 0))[0];
       if (!candidate) break;
       host.rememberSession(candidate); host.liveSessions.delete(candidate);
@@ -764,7 +871,7 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
       const id = session.threadId ?? session.runtimeId;
       const saved = rows.get(id);
       const preview = session.messages.find(message => message.role === 'user')?.text ?? session.draft;
-      rows.set(id, { id, title: saved?.title || preview || '新会话', preview: saved?.preview || preview, updatedAt: session.lastActivityAt ? Math.floor(session.lastActivityAt / 1000) : saved?.updatedAt ?? Math.floor(Date.now() / 1000), model: session.selectedModel?.displayName ?? '', status: session.approvals.size ? '等待授权' : session.busy ? session.phase : '就绪', live: true });
+      rows.set(id, { id, title: saved?.title || preview || '新会话', preview: saved?.preview || preview, updatedAt: session.lastActivityAt ? Math.floor(session.lastActivityAt / 1000) : saved?.updatedAt ?? Math.floor(Date.now() / 1000), model: session.selectedModel?.displayName ?? '', status: session.approvals.size ? '等待授权' : session.busy ? session.phase : session.queuedSubmissions.length ? `待执行 ${session.queuedSubmissions.length}` : '就绪', live: true });
     }
     return [...rows.values()].sort((a, b) => b.updatedAt - a.updatedAt);
   }
@@ -822,9 +929,11 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
       session.busy = resumed.thread.turns.some(turn => turn.status === 'inProgress');
       session.activeTurnId = resumed.thread.turns.find(turn => turn.status === 'inProgress')?.id;
       session.phase = session.busy ? '处理中' : '就绪';
+      await session.refreshQueued();
       session.restoreDraft(session.threadId);
       this.liveSessions.add(session); this.current = session; this.page = 'chat'; this.fullSync = true;
       this.pruneLiveSessions();
+      if (!session.busy && session.queuedSubmissions.length) void session.startNextQueued();
     } catch (error) {
       session.dispose();
       if (isAuthError(error)) this.authRequired = true; else this.historyError = `打开会话失败：${String(error)}`;
@@ -895,7 +1004,19 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     if (this.transition || !slashCommands.some(entry => entry.name===command)) return;
     try {
       const host = this.owner ?? this;
-      if (command === 'model' && option) await this.chooseModel(option);
+      if (command === 'btw') {
+        if(!option?.trim()){this.error('请输入 /btw 后要询问的问题。');return;}
+        if(!this.threadId || this.btwRequest || this.authRequired || host.authRequired) {
+          this.draft=this.draft?`/btw ${option}\n\n${this.draft}`:`/btw ${option}`;this.stashDraft();
+          this.error(this.btwRequest?'请等待上一个 /btw 问题回答完成。':!this.threadId?'请先开始一个会话，再使用 /btw。':'当前账号需要登录后才能使用 /btw。');return;
+        }
+        const epoch=this.epoch;const request={messageId:'btw-'+randomBytes(8).toString('hex'),turnId:undefined as string|undefined};this.btwRequest=request;
+        this.pushMessage({id:request.messageId+'-question',role:'user',text:'/btw '+option,turnId:request.messageId});
+        this.pushMessage({id:request.messageId,role:'assistant',text:'',status:'streaming',turnId:request.messageId});this.sync(true);
+        try {const result=await this.getAgent().btw(option,this.activeTurnId);if(epoch===this.epoch)request.turnId=result.turnId;}
+        catch(error) {if(epoch!==this.epoch)return;if(this.btwRequest===request)this.btwRequest=undefined;const message=this.messages.find(item=>item.id===request.messageId);if(message){message.role='error';message.status='failed';message.text=String(error);}this.draft=this.draft?`/btw ${option}\n\n${this.draft}`:`/btw ${option}`;this.stashDraft();this.sync(true);}
+      }
+      else if (command === 'model' && option) await this.chooseModel(option);
       else if (command === 'mode' && option) await this.chooseMode(option);
       else if (command === 'reasoning' && option) await this.chooseReasoning(option);
       else if (command === 'permissions') this.setPermissionMode(option);
@@ -1011,7 +1132,9 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
     this.transition = true; this.phase = '重新连接'; this.sync();
     try {
       if (!await this.ensureAuthenticated() || this.disposed) return;
-      this.restoreInFlight(); ++this.epoch; this.clearApprovals(); this.agent?.dispose(); this.agent = undefined;
+      this.restoreInFlight(); ++this.epoch; this.clearApprovals();
+      if(this.btwRequest){const message=this.messages.find(item=>item.id===this.btwRequest!.messageId);if(message){message.status='failed';message.role='error';message.text='连接已重置，请重新发送 /btw 问题。';}this.btwRequest=undefined;}
+      this.agent?.dispose(); this.agent = undefined;
       const saved = this.threadId;
       this.busy = false; this.compacting = false; this.activeTurnId = undefined;
       if (saved) {
@@ -1024,10 +1147,11 @@ export class Sidebar implements vscode.WebviewViewProvider, vscode.Disposable {
         this.selectedModel = { model: resumed.model, displayName: resumed.model, modelProviderId: resumed.modelProvider };
         this.busy = resumed.thread.turns.some(turn => turn.status === 'inProgress');
         this.activeTurnId = resumed.thread.turns.find(turn => turn.status === 'inProgress')?.id;
+        await this.refreshQueued();
       } else await this.getAgent().models();
       this.reconnectNeeded = false;
     } catch (error) { this.reconnectNeeded = true; this.error(`重新连接失败：${String(error)}`); }
-    finally { this.transition = false; this.phase = this.busy ? '处理中' : '就绪'; this.fullSync = true; this.sync(); const host = this.owner ?? this; host.fullSync = true; if (host.page === 'sessions') void host.loadSessions(); }
+    finally { this.transition = false; this.phase = this.busy ? '处理中' : '就绪'; this.fullSync = true; this.sync(); if (!this.busy && this.queuedSubmissions.length) void this.startNextQueued(); const host = this.owner ?? this; host.fullSync = true; if (host.page === 'sessions') void host.loadSessions(); }
   }
   private virtualUri(name: string, text: string) {
     const uri = vscode.Uri.from({ scheme: 'trae-review', path: `/${randomBytes(8).toString('hex')}/${name}` });

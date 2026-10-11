@@ -1,5 +1,35 @@
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
+import katex from 'katex';
+
+const mathPlaceholder = 'TRAE_MATH_PLACEHOLDER_';
+
+function protectMath(text) {
+  const formulas = [];
+  const pattern = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`|\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|(?<!\\)\$(?!\$)(?!\s)(?:\\.|[^$\n])*?\S(?<!\\)\$(?!\$))/g;
+  const source = text.replace(pattern, match => {
+    if (match.startsWith('`') || match.startsWith('~')) return match;
+    let tex;
+    let displayMode = false;
+    if (match.startsWith('$$')) { tex = match.slice(2, -2); displayMode = true; }
+    else if (match.startsWith('\\[')) { tex = match.slice(2, -2); displayMode = true; }
+    else if (match.startsWith('\\(')) tex = match.slice(2, -2);
+    else tex = match.slice(1, -1);
+    const index = formulas.length;
+    try {
+      formulas.push(katex.renderToString(tex.trim(), { displayMode, throwOnError: false, output: 'htmlAndMathml' }));
+      return `<!--${mathPlaceholder}${index}-->`;
+    } catch {
+      formulas.push(null);
+      return match;
+    }
+  });
+  return { source, formulas };
+}
+
+function restoreMath(html, formulas) {
+  return html.replace(new RegExp(`<!--${mathPlaceholder}(\\d+)-->`, 'g'), (match, index) => formulas[Number(index)] ?? match);
+}
 
 const caches = new WeakMap();
 function compatible(current, next) {
@@ -30,7 +60,8 @@ function patchChildren(parent, source) {
 export function renderMarkdown(body, text) {
   let cache = caches.get(body);
   if (!cache) { body.replaceChildren(); cache = { blocks: [], links: '' }; caches.set(body, cache); }
-  const tokens = marked.lexer(text);
+  const protectedText = protectMath(text);
+  const tokens = marked.lexer(protectedText.source);
   const links = JSON.stringify(tokens.links);
   for (let index = 0; index < tokens.length; index++) {
     const token = tokens[index];
@@ -43,7 +74,7 @@ export function renderMarkdown(body, text) {
     if (block.raw === token.raw && cache.links === links) continue;
     const single = [token]; single.links = tokens.links;
     const fragment = document.createElement('template');
-    fragment.innerHTML = DOMPurify.sanitize(marked.parser(single), { FORBID_TAGS: ['img'], FORBID_ATTR: ['style'] });
+    fragment.innerHTML = DOMPurify.sanitize(restoreMath(marked.parser(single), protectedText.formulas), { FORBID_TAGS: ['img'] });
     patchChildren(block.node, fragment.content);
     block.raw = token.raw;
   }

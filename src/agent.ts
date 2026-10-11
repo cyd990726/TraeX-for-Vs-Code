@@ -11,6 +11,12 @@ import type { ReasoningEffort } from './protocol/ReasoningEffort';
 import type { ModelListResponse } from './protocol/v2/ModelListResponse';
 import type { ModeChangeDecision } from './protocol/v2/ModeChangeDecision';
 import type { ModeChangeRespondResponse } from './protocol/v2/ModeChangeRespondResponse';
+import type { UserInput } from './protocol/v2/UserInput';
+import type { ThreadQueueAddResponse } from './protocol/v2/ThreadQueueAddResponse';
+import type { ThreadQueueListResponse } from './protocol/v2/ThreadQueueListResponse';
+import type { ThreadQueueUpdateResponse } from './protocol/v2/ThreadQueueUpdateResponse';
+import type { ThreadQueueDeleteResponse } from './protocol/v2/ThreadQueueDeleteResponse';
+import type { ThreadQueueStartResponse } from './protocol/v2/ThreadQueueStartResponse';
 
 export class Agent {
   private child?: ChildProcessWithoutNullStreams;
@@ -80,8 +86,8 @@ export class Agent {
           if (event.method === 'queue/status' && event.params.threadId === this.threadId) {
             if (event.params.operation !== 'contextCompaction' && ['queued', 'waiting', 'ready'].includes(event.params.state)) this.turnId = event.params.turnId;
             const timeout = event.params.operation === 'contextCompaction' || ['queued', 'waiting'].includes(event.params.state) ? this.options.queuedTurnTimeoutMs ?? 10 * 60 * 1000 : this.options.rpcTimeoutMs ?? 30000;
-            const queuedMethod = event.params.operation === 'contextCompaction' ? 'thread/compact/start' : 'turn/start';
-            for (const [id, pending] of this.pending) if (pending.method === queuedMethod) this.armTimeout(id, timeout);
+            const queuedMethods = event.params.operation === 'contextCompaction' ? ['thread/compact/start'] : ['turn/start','thread/queue/start'];
+            for (const [id, pending] of this.pending) if (queuedMethods.includes(pending.method)) this.armTimeout(id, timeout);
           }
           if (event.method === 'turn/started' && event.params.threadId === this.threadId) this.turnId = event.params.turn.id;
           if (event.method === 'turn/completed') {
@@ -98,7 +104,7 @@ export class Agent {
       }
     });
     await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-    await this.rpc('initialize', { clientInfo: { name: 'traecli-vscode', title: 'TRAE CLI Sidebar', version: '0.14.10' }, capabilities: { experimentalApi: false } });
+    await this.rpc('initialize', { clientInfo: { name: 'traecli-vscode', title: 'TRAE CLI Sidebar', version: '0.14.12' }, capabilities: { experimentalApi: true } });
     this.write({ method: 'initialized', params: {} });
     this.options.status?.('已连接');
   }
@@ -110,7 +116,7 @@ export class Agent {
       if (this.pending.get(id) !== pending) return;
       this.pending.delete(id); this.options.status?.('请求超时，请重新连接');
       const error = new Error(`${pending.method} 超时，请重新连接确认任务状态`);
-      if (pending.method === 'turn/start') error.name = 'TurnStartUncertain';
+      if (pending.method === 'turn/start' || pending.method === 'thread/queue/start') error.name = 'TurnStartUncertain';
       pending.reject(error);
     }, delay);
   }
@@ -126,7 +132,15 @@ export class Agent {
   async skills() { await this.initialize(); return this.rpc<{data:{cwd:string;skills:{name:string;description:string;path:string;enabled:boolean}[]}[]}>('skills/list', {cwds:[this.options.cwd],forceReload:true}); }
   async compact(guidance?: string) { await this.initialize(); if (!this.threadId) throw new Error('请先开始一个会话'); return this.rpc('thread/compact/start', {threadId:this.threadId,...(guidance ? {userGuidance:guidance} : {})}, this.options.queuedTurnTimeoutMs ?? 10 * 60 * 1000); }
   async models() { await this.initialize(); return this.rpc<ModelListResponse>('model/list', {}); }
+  async btw(question: string, turnId?: string) { await this.initialize(); if (!this.threadId) throw new Error('请先开始一个会话'); return this.rpc<{turnId:string}>('turn/btw', {threadId:this.threadId,question,...(turnId?{turnId}:{})}); }
   async respondModeChange(threadId: string, requestId: string, decision: ModeChangeDecision) { await this.initialize(); return this.rpc<ModeChangeRespondResponse>('mode/change/respond', {threadId,requestId,decision}); }
+  private queuedInput(text: string, skills?: {name:string;path:string}[]): UserInput[] { return [{type:'text',text,text_elements:[]},...(skills ?? []).map(skill=>({type:'skill' as const,...skill}))]; }
+  async addQueued(text: string, clientUserMessageId: string, skills?: {name:string;path:string}[]) { await this.initialize(); if (!this.threadId) throw new Error('请先开始一个会话'); return this.rpc<ThreadQueueAddResponse>('thread/queue/add', {threadId:this.threadId,input:this.queuedInput(text,skills),clientUserMessageId}); }
+  async listQueued() { await this.initialize(); if (!this.threadId) return {data:[],nextCursor:null} satisfies ThreadQueueListResponse; return this.rpc<ThreadQueueListResponse>('thread/queue/list', {threadId:this.threadId,cursor:null,limit:100}); }
+  async updateQueued(queuedSubmissionId: string, input: UserInput[]) { await this.initialize(); if (!this.threadId) throw new Error('请先开始一个会话'); return this.rpc<ThreadQueueUpdateResponse>('thread/queue/update', {threadId:this.threadId,queuedSubmissionId,input}); }
+  async deleteQueued(queuedSubmissionId: string) { await this.initialize(); if (!this.threadId) throw new Error('请先开始一个会话'); return this.rpc<ThreadQueueDeleteResponse>('thread/queue/delete', {threadId:this.threadId,queuedSubmissionId}); }
+  async reorderQueued(queuedSubmissionIds: string[]) { await this.initialize(); if (!this.threadId) throw new Error('请先开始一个会话'); return this.rpc<Record<string,never>>('thread/queue/reorder', {threadId:this.threadId,queuedSubmissionIds}); }
+  async startQueued(queuedSubmissionId?: string) { await this.initialize(); if (!this.threadId) throw new Error('请先开始一个会话'); const result=await this.rpc<ThreadQueueStartResponse>('thread/queue/start', {threadId:this.threadId,...(queuedSubmissionId?{queuedSubmissionId}:{})}); if(result.turn.status==='inProgress')this.turnId=result.turn.id; return result; }
   async resume(threadId: string) { await this.initialize(); const result = await this.rpc<ThreadResumeResponse>('thread/resume', { threadId, cwd: this.options.cwd }); this.defaultPermissions = result.approvalPolicy && result.sandbox ? {approvalPolicy:result.approvalPolicy,sandboxPolicy:result.sandbox} : undefined; this.threadId = result.thread.id; this.turnId = result.thread.turns.find(turn => turn.status === 'inProgress')?.id; this.completedTurns.clear(); return result; }
   newThread() { this.threadId = undefined; this.turnId = undefined; this.completedTurns.clear(); }
   async prompt(text: string, model?: string, modelProvider?: string, effort?: ReasoningEffort, modelBackendVariant?: string, permissions?: Permissions, skills?: {name:string;path:string}[]) {
